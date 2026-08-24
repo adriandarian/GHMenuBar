@@ -154,7 +154,7 @@ final class MenuBarCursorAffordanceTests: XCTestCase {
 
         XCTAssertTrue(source.contains("Text(\"Set Up Review\")"))
         XCTAssertTrue(source.contains("if let configuredAgentTool"))
-        XCTAssertTrue(source.contains("Text(\"Review\")"))
+        XCTAssertTrue(source.contains("Label(\"Review\", systemImage: \"sparkles\")"))
         XCTAssertFalse(
             source.contains("if isAgentReviewSupported"),
             "A missing local-review scope should turn the action into configuration guidance, not hide it."
@@ -168,7 +168,8 @@ final class MenuBarCursorAffordanceTests: XCTestCase {
         XCTAssertTrue(source.contains("private static let reviewToolChoices: [AgentReviewTool] = [.claudeCode, .copilot, .codexCLI]"))
         XCTAssertTrue(source.contains("ForEach(Self.reviewToolChoices) { agentTool in"))
         XCTAssertTrue(source.contains("Label(\"\\(agentTool.displayName) (Default)\", systemImage: \"checkmark\")"))
-        XCTAssertTrue(source.contains("Text(\"\\(configuredAgentTool.displayName) default\")"))
+        XCTAssertTrue(source.contains("onLaunchAgentReview(configuredAgentTool)"))
+        XCTAssertTrue(source.contains("EmptyView()\n                                .frame(width: 8, height: 22)"))
         XCTAssertTrue(source.contains(".menuStyle(.borderlessButton)"))
     }
 

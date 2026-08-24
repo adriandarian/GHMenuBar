@@ -42,6 +42,7 @@ public struct GitHubCLI: Sendable {
     public static let defaultOpenPullRequestLimit = 1_000
     public static let defaultRepositoryOpenPullRequestLimit = 48
     private static let badCredentialsMessage = "GitHub credentials were rejected. Run `gh auth login -h github.com` or `gh auth refresh -h github.com`."
+    private static let transientRetryDelays: [Duration] = [.milliseconds(250), .milliseconds(750)]
     private static let searchPullRequestJSONFields = "title,url,repository,author,updatedAt,isDraft"
     private static let repositoryPullRequestJSONFields = [
         "title",
@@ -213,7 +214,7 @@ public struct GitHubCLI: Sendable {
     }
 
     private func runGitHubCommand(arguments: [String]) async throws -> ProcessResult {
-        let result: ProcessResult
+        var result: ProcessResult
         do {
             result = try await runner.run(
                 executable: "gh",
@@ -221,6 +222,15 @@ public struct GitHubCLI: Sendable {
             )
         } catch {
             throw GitHubCLIError.processFailed(message: error.localizedDescription)
+        }
+
+        for delay in Self.transientRetryDelays where Self.isTransientFailure(result) {
+            try await Task.sleep(for: delay)
+            do {
+                result = try await runner.run(executable: "gh", arguments: arguments)
+            } catch {
+                throw GitHubCLIError.processFailed(message: error.localizedDescription)
+            }
         }
 
         guard result.exitCode == 0 else {
@@ -278,6 +288,21 @@ public struct GitHubCLI: Sendable {
 
         return combinedOutput.contains("401")
             && combinedOutput.contains("bad credentials")
+    }
+
+    private static func isTransientFailure(_ result: ProcessResult) -> Bool {
+        guard result.exitCode != 0 else { return false }
+
+        let output = [result.stderr, result.stdout]
+            .joined(separator: "\n")
+            .lowercased()
+
+        return output.contains("502")
+            || output.contains("503")
+            || output.contains("504")
+            || output.contains("gateway timeout")
+            || output.contains("timed out")
+            || output.contains("timeout")
     }
 
     private func decodePullRequests(from stdout: String, repositoryOverride: String? = nil) throws -> [PullRequest] {

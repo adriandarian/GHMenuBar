@@ -104,8 +104,8 @@ public struct PullRequestAgentReviewLauncher: Sendable {
         let result: ProcessResult
         do {
             result = try await runner.run(
-                executable: "open",
-                arguments: ["-a", "Terminal", scriptURL.path]
+                executable: "/usr/bin/osascript",
+                arguments: ["-l", "JavaScript", "-e", Self.terminalLaunchJavaScript, scriptURL.path]
             )
         } catch {
             throw Error.processFailed(
@@ -217,7 +217,10 @@ public struct PullRequestAgentReviewLauncher: Sendable {
         let prompt = settings.reviewScopes.isEmpty
             ? prompt(for: pullRequest, reviewCommand: reviewCommand)
             : renderedPromptTemplate(reviewCommand, for: pullRequest, reviewProfile: reviewProfile)
-        let quotedPrompt = Self.shellQuoted(prompt)
+        let agentPrompt = agentTool == .copilot
+            ? copilotCompatiblePrompt(prompt, for: pullRequest)
+            : prompt
+        let quotedPrompt = Self.shellQuoted(agentPrompt)
         let command: String
         switch agentTool {
         case .codexCLI:
@@ -292,6 +295,27 @@ public struct PullRequestAgentReviewLauncher: Sendable {
         """
     }
 
+    private func copilotCompatiblePrompt(
+        _ prompt: String,
+        for pullRequest: PullRequest
+    ) -> String {
+        guard let skillName = Self.workspaceSkillName(from: prompt) else {
+            return prompt
+        }
+
+        let reviewTarget = Self.pullRequestNumber(from: pullRequest.url)
+            .map(String.init) ?? pullRequest.url.absoluteString
+
+        return """
+        You are explicitly invoking the workspace skill `/\(skillName)`.
+        Before taking any other action, read and follow `.claude/skills/\(skillName)/SKILL.md`.
+
+        Skill invocation: \(prompt)
+        Target pull request: \(pullRequest.repository) \(reviewTarget)
+        URL: \(pullRequest.url.absoluteString)
+        """
+    }
+
     private func guardedCommandScript(
         command: String,
         commandName: String,
@@ -333,6 +357,51 @@ public struct PullRequestAgentReviewLauncher: Sendable {
             return "copilot"
         }
     }
+
+    private static func workspaceSkillName(from prompt: String) -> String? {
+        let command = prompt
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(whereSeparator: \.isWhitespace)
+            .first
+
+        guard let command,
+              command.first == "/"
+        else {
+            return nil
+        }
+
+        let skillName = command.dropFirst()
+        guard !skillName.isEmpty,
+              skillName.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" })
+        else {
+            return nil
+        }
+
+        return String(skillName)
+    }
+
+    private static let terminalLaunchJavaScript = """
+    function run(argv) {
+        if (argv.length !== 1) {
+            throw new Error("Expected one review-script path.");
+        }
+
+        const terminal = Application("Terminal");
+        const reviewTab = terminal.doScript("");
+        const promptPattern = /(?:^|\\n)[^\\n]*[>$%#❯] ?\\s*$/u;
+        const commandToRun = "/bin/zsh '" + argv[0].replace(/'/g, "'\\\\''") + "'";
+
+        terminal.activate();
+        for (let attempt = 0; attempt < 300; attempt++) {
+            if (promptPattern.test(reviewTab.contents())) {
+                terminal.doScript(commandToRun, { in: reviewTab });
+                return;
+            }
+            delay(0.1);
+        }
+        throw new Error("Terminal did not show a shell prompt within 30 seconds.");
+    }
+    """
 
     private static func failureDetails(from result: ProcessResult) -> String {
         [result.stderr, result.stdout]

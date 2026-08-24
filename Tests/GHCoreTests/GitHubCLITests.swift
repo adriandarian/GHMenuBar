@@ -418,6 +418,32 @@ final class GitHubCLITests: XCTestCase {
         }
     }
 
+    func testFetchOpenPullRequestsRetriesTransientGatewayTimeout() async throws {
+        let runner = SequencedProcessRunner(results: [
+            ProcessResult(stdout: "", stderr: "HTTP 504: 504 Gateway Timeout (https://api.github.com/graphql)", exitCode: 1),
+            ProcessResult(stdout: "[]", stderr: "", exitCode: 0)
+        ])
+        let client = GitHubCLI(owner: "acme", runner: runner)
+
+        let pullRequests = try await client.fetchOpenPullRequests(limit: 20)
+        XCTAssertTrue(pullRequests.isEmpty)
+        XCTAssertEqual(runner.commands.count, 2)
+    }
+
+    func testFetchOpenPullRequestsDoesNotRetryUnrelatedFailure() async {
+        let runner = SequencedProcessRunner(results: [
+            ProcessResult(stdout: "", stderr: "permission denied", exitCode: 1)
+        ])
+        let client = GitHubCLI(owner: "acme", runner: runner)
+
+        do {
+            _ = try await client.fetchOpenPullRequests(limit: 20)
+            XCTFail("Expected fetchOpenPullRequests to throw")
+        } catch {
+            XCTAssertEqual(runner.commands.count, 1)
+        }
+    }
+
     func testFetchOpenPullRequestsShowsActionableMessageForBadCredentials() async {
         let result = ProcessResult(
             stdout: "",

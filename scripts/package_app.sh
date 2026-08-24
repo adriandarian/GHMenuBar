@@ -14,15 +14,22 @@ source "$ROOT_DIR/scripts/swift_env.sh"
 swift build "${SWIFTPM_CACHE_ARGS[@]}" -c release >/dev/null
 BIN_DIR="$(swift build "${SWIFTPM_CACHE_ARGS[@]}" -c release --show-bin-path)"
 BINARY="$BIN_DIR/GHMenuBar"
+RESOURCE_BUNDLE="$BIN_DIR/GHMenuBar_GHMenuBar.bundle"
 
 if [[ ! -x "$BINARY" ]]; then
   echo "Missing built binary at $BINARY" >&2
   exit 1
 fi
 
+if [[ ! -d "$RESOURCE_BUNDLE" ]]; then
+  echo "Missing resource bundle at $RESOURCE_BUNDLE" >&2
+  exit 1
+fi
+
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 cp "$BINARY" "$MACOS_DIR/GHMenuBar"
+cp "$RESOURCE_BUNDLE/empty-review-break.png" "$RESOURCES_DIR/"
 
 cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -54,7 +61,9 @@ cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
 PLIST
 
 if command -v codesign >/dev/null 2>&1; then
-  codesign --force --deep --sign - "$APP_DIR" >/dev/null
+  # Override SIGNING_IDENTITY for another local identity or ad-hoc signing.
+  SIGNING_IDENTITY="${SIGNING_IDENTITY:-C27D9B4458FF4C055F91B09861E39A3FB90771AB}"
+  codesign --force --deep --sign "$SIGNING_IDENTITY" "$APP_DIR" >/dev/null
 fi
 
 echo "$APP_DIR"

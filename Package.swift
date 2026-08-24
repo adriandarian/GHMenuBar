@@ -15,7 +15,8 @@ let package = Package(
         .target(name: "GHCore"),
         .executableTarget(
             name: "GHMenuBar",
-            dependencies: ["GHCore"]
+            dependencies: ["GHCore"],
+            resources: [.process("Resources")]
         ),
         .testTarget(
             name: "GHCoreTests",
@@ -23,4 +24,3 @@ let package = Package(
         )
     ]
 )
-

@@ -103,6 +103,34 @@ final class PullRequestAgentReviewLauncherTests: XCTestCase {
         XCTAssertFalse(script.contains("exec copilot"))
     }
 
+    func testCopilotExpandsWorkspaceSkillPromptWithPullRequestTarget() {
+        let launcher = PullRequestAgentReviewLauncher(settings: AgentReviewSettings(
+            isEnabled: true,
+            supportedRepository: "",
+            workspacePath: "/Users/example/ndp",
+            reviewScopes: [
+                AgentReviewScope(
+                    pattern: "acme/frontend",
+                    localReview: .override(AgentReviewLocalWorkflow(
+                        agentTool: .copilot,
+                        workspacePathTemplate: "/Users/example/ndp",
+                        promptTemplate: "/ndp-pr-review"
+                    )),
+                    cloudReview: .disabled
+                )
+            ]
+        ))
+
+        let script = launcher.terminalCommandScript(for: samplePullRequest(
+            repository: "acme/frontend",
+            number: 42
+        ))
+
+        XCTAssertTrue(script.contains("read and follow `.claude/skills/ndp-pr-review/SKILL.md`"))
+        XCTAssertTrue(script.contains("Skill invocation: /ndp-pr-review"))
+        XCTAssertTrue(script.contains("Target pull request: acme/frontend 42"))
+    }
+
     func testReviewProfileControlsWorkspaceToolAndCommand() {
         let launcher = PullRequestAgentReviewLauncher(settings: AgentReviewSettings(
             isEnabled: true,
@@ -306,9 +334,13 @@ final class PullRequestAgentReviewLauncherTests: XCTestCase {
 
         try await launcher.launchReview(for: pullRequest)
 
-        XCTAssertEqual(runner.invocations.map(\.executable), ["/bin/zsh", "open"])
+        XCTAssertEqual(runner.invocations.map(\.executable), ["/bin/zsh", "/usr/bin/osascript"])
         let arguments = try XCTUnwrap(runner.invocations.last?.arguments)
-        XCTAssertEqual(Array(arguments.prefix(2)), ["-a", "Terminal"])
+        XCTAssertEqual(Array(arguments.prefix(3)), ["-l", "JavaScript", "-e"])
+        XCTAssertTrue(arguments.dropFirst(3).first?.contains("function run(argv)") == true)
+        XCTAssertTrue(arguments.dropFirst(3).first?.contains("promptPattern") == true)
+        XCTAssertTrue(arguments.dropFirst(3).first?.contains("attempt < 300") == true)
+        XCTAssertTrue(arguments.dropFirst(3).first?.contains("terminal.doScript(commandToRun, { in: reviewTab })") == true)
         let scriptPath = try XCTUnwrap(arguments.last)
         XCTAssertTrue(scriptPath.hasSuffix(".command"))
 
@@ -626,7 +658,9 @@ final class PullRequestAgentReviewLauncherTests: XCTestCase {
 
     private func launchedScript(from runner: CapturingProcessRunner) throws -> String {
         let arguments = try XCTUnwrap(runner.invocations.last?.arguments)
-        XCTAssertEqual(Array(arguments.prefix(2)), ["-a", "Terminal"])
+        XCTAssertEqual(Array(arguments.prefix(3)), ["-l", "JavaScript", "-e"])
+        XCTAssertTrue(arguments.dropFirst(3).first?.contains("function run(argv)") == true)
+        XCTAssertTrue(arguments.dropFirst(3).first?.contains("promptPattern") == true)
         return try String(
             contentsOfFile: XCTUnwrap(arguments.last),
             encoding: .utf8

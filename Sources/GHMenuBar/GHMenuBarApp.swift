@@ -784,11 +784,7 @@ struct PullRequestMenuView: View {
                 message: "Fetching open pull requests for the selected repository."
             )
         case .loaded(let selection, false, _) where store.visiblePullRequests.isEmpty:
-            StateRow(
-                symbol: "checkmark.circle",
-                title: "No pull requests need review",
-                message: "\(selection.selectedRepositoryName ?? "Selected repository") has no unreviewed pull requests or updates after your last review."
-            )
+            EmptyReviewState()
         case .loaded(_, false, _):
             let pullRequests = store.visiblePullRequests
             VStack(alignment: .leading, spacing: 8) {
@@ -2519,6 +2515,37 @@ private struct AgentReviewProfileDraft: Identifiable, Equatable {
     }
 }
 
+private struct EmptyReviewState: View {
+    var body: some View {
+        VStack(alignment: .center, spacing: 8) {
+            if let image = NSImage(contentsOf: resourceURL) {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 180, height: 120)
+                    .accessibilityHidden(true)
+            } else {
+                Image(systemName: "cup.and.saucer.fill")
+                    .font(.system(size: 44))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 180, height: 120)
+                    .accessibilityLabel("A peaceful break")
+            }
+
+            Text("You’re all caught up")
+                .font(.headline)
+
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 6)
+    }
+
+    private var resourceURL: URL {
+        Bundle.main.url(forResource: "empty-review-break", withExtension: "png")
+            ?? URL(fileURLWithPath: "/dev/null")
+    }
+}
+
 struct PullRequestRow: View {
     let pullRequest: PullRequest
     let currentUserLogin: String?
@@ -2542,43 +2569,38 @@ struct PullRequestRow: View {
             .pointingHandCursor()
 
             VStack(spacing: 8) {
-                Button {
-                    NSWorkspace.shared.open(pullRequest.url)
-                } label: {
-                    Image(systemName: "arrow.up.forward.square")
-                }
-                .buttonStyle(.borderless)
-                .pointingHandCursor()
-                .help("Open pull request")
-
                 if let configuredAgentTool {
-                    Menu {
-                        ForEach(Self.reviewToolChoices) { agentTool in
-                            Button {
-                                onLaunchAgentReview(agentTool)
-                            } label: {
-                                if agentTool == configuredAgentTool {
-                                    Label("\(agentTool.displayName) (Default)", systemImage: "checkmark")
-                                } else {
-                                    Text(agentTool.displayName)
+                    HStack(spacing: 0) {
+                        Button {
+                            onLaunchAgentReview(configuredAgentTool)
+                        } label: {
+                            Label("Review", systemImage: "sparkles")
+                        }
+                        .buttonStyle(.borderless)
+                        .pointingHandCursor()
+                        .help("Start review with the default agent: \(configuredAgentTool.displayName)")
+
+                        Menu {
+                            ForEach(Self.reviewToolChoices) { agentTool in
+                                Button {
+                                    onLaunchAgentReview(agentTool)
+                                } label: {
+                                    if agentTool == configuredAgentTool {
+                                        Label("\(agentTool.displayName) (Default)", systemImage: "checkmark")
+                                    } else {
+                                        Text(agentTool.displayName)
+                                    }
                                 }
                             }
+                        } label: {
+                            EmptyView()
+                                .frame(width: 8, height: 22)
                         }
-                    } label: {
-                        Label {
-                            VStack(alignment: .leading, spacing: 0) {
-                                Text("Review")
-                                Text("\(configuredAgentTool.displayName) default")
-                                    .foregroundStyle(.secondary)
-                            }
-                        } icon: {
-                            Image(systemName: "sparkles")
-                        }
+                        .menuStyle(.borderlessButton)
+                        .pointingHandCursor()
+                        .help("Choose a different review agent")
                     }
-                    .menuStyle(.borderlessButton)
                     .fixedSize()
-                    .pointingHandCursor()
-                    .help("Choose review agent. Default: \(configuredAgentTool.displayName)")
                 } else {
                     Button {
                         onConfigureAgentReview()
