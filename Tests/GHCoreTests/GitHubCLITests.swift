@@ -38,6 +38,27 @@ final class GitHubCLITests: XCTestCase {
         XCTAssertEqual(runner.lastArguments, GitHubCLI.repositoryListCommand(owner: "", limit: 100))
     }
 
+    func testFetchRepositoriesSurfacesStderrWhenGhExitsZeroWithoutJson() async {
+        let runner = StubProcessRunner(result: .success(ProcessResult(
+            stdout: "",
+            stderr: "error connecting to api.github.com",
+            exitCode: 0
+        )))
+        let client = GitHubCLI(owner: "", runner: runner)
+
+        do {
+            _ = try await client.fetchRepositories(limit: 100)
+            XCTFail("Expected gh stderr to be surfaced")
+        } catch let error as GitHubCLIError {
+            XCTAssertEqual(
+                error,
+                .commandFailed(message: "error connecting to api.github.com", exitCode: 0)
+            )
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
     func testFetchOpenPullRequestsUsesAuthenticatedDefaultScopeWhenOwnerIsBlank() async throws {
         let runner = StubProcessRunner(result: .success(ProcessResult(stdout: "[]", stderr: "", exitCode: 0)))
         let client = GitHubCLI(owner: "", runner: runner)
@@ -150,7 +171,7 @@ final class GitHubCLITests: XCTestCase {
                 "--state", "open",
                 "--search", "draft:false",
                 "--limit", "100",
-                "--json", "title,url,author,updatedAt,isDraft,reviewDecision,reviewRequests,latestReviews,statusCheckRollup,commits"
+                "--json", "title,url,author,updatedAt,isDraft,baseRefName,reviewDecision,reviewRequests,latestReviews,statusCheckRollup,commits"
             ]
         )
     }
@@ -322,6 +343,39 @@ final class GitHubCLITests: XCTestCase {
             pullRequests[0].latestCommitCommittedAt,
             try githubDate("2026-06-16T07:30:00Z")
         )
+    }
+
+    func testFetchOpenPullRequestsIgnoresBaseBranchUpdateAfterReview() async throws {
+        let json = """
+        [
+          {
+            "title": "Update tile routing",
+            "url": "https://github.com/acme/widget/pull/45",
+            "author": {"login": "octocat"},
+            "updatedAt": "2026-06-16T08:00:00Z",
+            "isDraft": false,
+            "baseRefName": "main",
+            "reviewDecision": "CHANGES_REQUESTED",
+            "reviewRequests": [],
+            "latestReviews": [
+              {"author": {"login": "dariana"}, "state": "CHANGES_REQUESTED", "submittedAt": "2026-06-16T07:45:00Z"}
+            ],
+            "statusCheckRollup": [],
+            "commits": [
+              {"committedDate": "2026-06-16T07:30:00Z", "messageHeadline": "feat: update tile routing"},
+              {"committedDate": "2026-06-16T08:00:00Z", "messageHeadline": "Merge branch 'main' into UPP-93733"}
+            ]
+          }
+        ]
+        """
+        let runner = StubProcessRunner(result: .success(ProcessResult(stdout: json, stderr: "", exitCode: 0)))
+        let client = GitHubCLI(owner: "acme", runner: runner)
+
+        let pullRequests = try await client.fetchOpenPullRequests(repository: "acme/widget", limit: 20)
+        let pullRequest = try XCTUnwrap(pullRequests.first)
+
+        XCTAssertEqual(pullRequest.latestCommitCommittedAt, try githubDate("2026-06-16T07:30:00Z"))
+        XCTAssertFalse(pullRequest.needsReview(from: "dariana"))
     }
 
     func testFetchViewerLoginUsesGitHubAPI() async throws {

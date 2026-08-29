@@ -72,6 +72,9 @@ final class MenuBarCursorAffordanceTests: XCTestCase {
         XCTAssertTrue(source.contains("AgentReviewScopeEditor("))
         XCTAssertTrue(source.contains("AgentReviewWorkflowCard("))
         XCTAssertTrue(source.contains("modeTitle: \"Local review mode\""))
+        XCTAssertTrue(source.contains("Toggle(\"Use isolated worktree\", isOn: $scope.localUsesWorktree)"))
+        XCTAssertTrue(source.contains("LabeledContent(\"Worktree root\")"))
+        XCTAssertTrue(source.contains("agentReview.hasValidWorktreeConfigurations"))
         XCTAssertTrue(source.contains("CloudReviewUnavailableCard("))
         XCTAssertTrue(source.contains("GHMenuBar does not currently have a cloud review executor."))
         XCTAssertFalse(source.contains("modeTitle: \"Cloud review mode\""))
@@ -244,7 +247,8 @@ final class MenuBarCursorAffordanceTests: XCTestCase {
 
         XCTAssertTrue(source.contains("Accepted forms: *, owner/*, or owner/repo."))
         XCTAssertTrue(source.contains("filesystem paths belong in Workspace."))
-        XCTAssertTrue(source.contains("guard agentReview.hasValidScopePatterns else"))
+        XCTAssertTrue(source.contains("guard agentReview.hasValidScopePatterns,"))
+        XCTAssertTrue(source.contains("agentReview.hasValidWorktreeConfigurations"))
         XCTAssertTrue(source.contains("reviewScopes.allSatisfy(\\.isPatternValid)"))
     }
 

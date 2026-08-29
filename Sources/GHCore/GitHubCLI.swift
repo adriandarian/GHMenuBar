@@ -50,6 +50,7 @@ public struct GitHubCLI: Sendable {
         "author",
         "updatedAt",
         "isDraft",
+        "baseRefName",
         "reviewDecision",
         "reviewRequests",
         "latestReviews",
@@ -231,6 +232,18 @@ public struct GitHubCLI: Sendable {
             } catch {
                 throw GitHubCLIError.processFailed(message: error.localizedDescription)
             }
+        }
+
+        // gh can report API/network failures on stderr while still exiting 0.
+        // Do not pass an empty stdout through to JSONDecoder, which hides the
+        // actionable CLI message behind "unexpected end of JSON input".
+        if result.exitCode == 0,
+           result.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           !result.stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            throw GitHubCLIError.commandFailed(
+                message: Self.commandFailureMessage(for: result),
+                exitCode: result.exitCode
+            )
         }
 
         guard result.exitCode == 0 else {

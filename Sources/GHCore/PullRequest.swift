@@ -136,6 +136,7 @@ struct GitHubPullRequestDTO: Decodable {
     let author: Author
     let updatedAt: Date
     let isDraft: Bool
+    let baseRefName: String?
     let reviewDecision: String?
     let reviewRequests: [ReviewRequest]?
     let latestReviews: [Review]?
@@ -168,6 +169,18 @@ struct GitHubPullRequestDTO: Decodable {
 
     struct Commit: Decodable {
         let committedDate: Date?
+        let messageHeadline: String?
+
+        func isBaseBranchUpdate(baseRefName: String?) -> Bool {
+            guard let baseRefName = baseRefName?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !baseRefName.isEmpty,
+                  let messageHeadline
+            else {
+                return false
+            }
+
+            return messageHeadline.hasPrefix("Merge branch '\(baseRefName)' into ")
+        }
     }
 
     func model(repositoryOverride: String? = nil) -> PullRequest {
@@ -189,7 +202,10 @@ struct GitHubPullRequestDTO: Decodable {
     }
 
     private var latestCommitCommittedAt: Date? {
-        commits?.compactMap(\.committedDate).max()
+        commits?
+            .filter { !$0.isBaseBranchUpdate(baseRefName: baseRefName) }
+            .compactMap(\.committedDate)
+            .max()
     }
 
     private var reviewSummary: PullRequestReviewSummary? {

@@ -160,10 +160,16 @@ public struct RepositoryFilterSettings: Equatable, Sendable {
 
 public struct AgentReviewSettings: Equatable, Sendable {
     public static let defaultPrompt = "Review this pull request."
+    public static let defaultAppleTerminalProfile = "GHMenuBar Review"
+    public static let defaultCustomTerminalArguments = "{shell}\n{script}"
 
     public let isEnabled: Bool
     public let supportedRepository: String
     public let workspacePath: String
+    public let terminal: AgentReviewTerminal
+    public let appleTerminalProfile: String
+    public let customTerminalExecutable: String
+    public let customTerminalArguments: String
     public let agentTool: AgentReviewTool
     public let agentToolOverrides: [String: AgentReviewTool]
     public let reviewProfiles: [AgentReviewProfile]
@@ -175,6 +181,10 @@ public struct AgentReviewSettings: Equatable, Sendable {
         isEnabled: Bool,
         supportedRepository: String,
         workspacePath: String,
+        terminal: AgentReviewTerminal = .automatic,
+        appleTerminalProfile: String = Self.defaultAppleTerminalProfile,
+        customTerminalExecutable: String = "",
+        customTerminalArguments: String = Self.defaultCustomTerminalArguments,
         agentTool: AgentReviewTool = .claudeCode,
         agentToolOverrides: [String: AgentReviewTool] = [:],
         reviewProfiles: [AgentReviewProfile] = [],
@@ -185,6 +195,10 @@ public struct AgentReviewSettings: Equatable, Sendable {
         self.isEnabled = isEnabled
         self.supportedRepository = supportedRepository
         self.workspacePath = workspacePath
+        self.terminal = terminal
+        self.appleTerminalProfile = appleTerminalProfile
+        self.customTerminalExecutable = customTerminalExecutable
+        self.customTerminalArguments = customTerminalArguments
         self.agentTool = agentTool
         self.agentToolOverrides = agentToolOverrides
         self.reviewProfiles = reviewProfiles
@@ -198,6 +212,10 @@ public struct AgentReviewSettings: Equatable, Sendable {
             isEnabled: isEnabled,
             supportedRepository: supportedRepository.trimmingCharacters(in: .whitespacesAndNewlines),
             workspacePath: workspacePath.trimmingCharacters(in: .whitespacesAndNewlines),
+            terminal: terminal,
+            appleTerminalProfile: appleTerminalProfile.trimmingCharacters(in: .whitespacesAndNewlines),
+            customTerminalExecutable: customTerminalExecutable.trimmingCharacters(in: .whitespacesAndNewlines),
+            customTerminalArguments: customTerminalArguments.trimmingCharacters(in: .whitespacesAndNewlines),
             agentTool: agentTool,
             agentToolOverrides: agentToolOverrides.reduce(into: [String: AgentReviewTool]()) { overrides, entry in
                 let normalizedPattern = entry.key.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -358,6 +376,31 @@ public struct AgentReviewSettings: Equatable, Sendable {
         template
             .replacingOccurrences(of: "{repo}", with: repository)
             .replacingOccurrences(of: "{repoName}", with: repositoryName(from: repository))
+    }
+}
+
+public enum AgentReviewTerminal: String, CaseIterable, Identifiable, Codable, Sendable {
+    case automatic
+    case ghostty
+    case cmux
+    case appleTerminal = "apple-terminal"
+    case custom
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .automatic:
+            return "Automatic"
+        case .ghostty:
+            return "Ghostty"
+        case .cmux:
+            return "cmux"
+        case .appleTerminal:
+            return "Apple Terminal"
+        case .custom:
+            return "Custom"
+        }
     }
 }
 
@@ -536,35 +579,72 @@ public enum AgentReviewCloudSetting: Equatable, Codable, Sendable {
 }
 
 public struct AgentReviewLocalWorkflow: Equatable, Codable, Sendable {
+    public static let defaultWorktreeRootPathTemplate = "~/.ghmenubar/worktrees"
+
     public let agentTool: AgentReviewTool
+    public let codexModel: String?
+    public let claudeModel: String?
+    public let copilotModel: String?
     public let workspacePathTemplate: String
     public let promptRootPathTemplate: String?
+    public let worktreeRootPathTemplate: String?
     public let promptTemplate: String
 
     public init(
         agentTool: AgentReviewTool,
+        codexModel: String? = nil,
+        claudeModel: String? = nil,
+        copilotModel: String? = nil,
         workspacePathTemplate: String,
         promptRootPathTemplate: String? = nil,
+        worktreeRootPathTemplate: String? = nil,
         promptTemplate: String
     ) {
         self.agentTool = agentTool
+        self.codexModel = codexModel
+        self.claudeModel = claudeModel
+        self.copilotModel = copilotModel
         self.workspacePathTemplate = workspacePathTemplate
         self.promptRootPathTemplate = promptRootPathTemplate
+        self.worktreeRootPathTemplate = worktreeRootPathTemplate
         self.promptTemplate = promptTemplate
+    }
+
+    public func model(for agentTool: AgentReviewTool) -> String? {
+        switch agentTool {
+        case .codexCLI:
+            return codexModel
+        case .claudeCode:
+            return claudeModel
+        case .copilot:
+            return copilotModel
+        }
     }
 
     fileprivate func sanitized() -> AgentReviewLocalWorkflow? {
         let normalizedWorkspacePathTemplate = workspacePathTemplate.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedPromptRootPathTemplate = promptRootPathTemplate?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedWorktreeRootPathTemplate = worktreeRootPathTemplate?.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedPromptTemplate = promptTemplate.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedWorkspacePathTemplate.isEmpty, !normalizedPromptTemplate.isEmpty else { return nil }
 
         return AgentReviewLocalWorkflow(
             agentTool: agentTool,
+            codexModel: Self.normalizedModel(codexModel),
+            claudeModel: Self.normalizedModel(claudeModel),
+            copilotModel: Self.normalizedModel(copilotModel),
             workspacePathTemplate: normalizedWorkspacePathTemplate,
             promptRootPathTemplate: normalizedPromptRootPathTemplate?.isEmpty == false ? normalizedPromptRootPathTemplate : nil,
+            worktreeRootPathTemplate: normalizedWorktreeRootPathTemplate?.isEmpty == false
+                ? normalizedWorktreeRootPathTemplate
+                : nil,
             promptTemplate: normalizedPromptTemplate
         )
+    }
+
+    private static func normalizedModel(_ model: String?) -> String? {
+        let normalizedModel = model?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalizedModel?.isEmpty == false ? normalizedModel : nil
     }
 }
 
@@ -710,6 +790,10 @@ public struct GHMenuBarSettingsStorage {
     public static let agentReviewEnabledKey = "GHMenuBar.settings.agentReview.enabled"
     public static let agentReviewSupportedRepositoryKey = "GHMenuBar.settings.agentReview.supportedRepository"
     public static let agentReviewWorkspacePathKey = "GHMenuBar.settings.agentReview.workspacePath"
+    public static let agentReviewTerminalKey = "GHMenuBar.settings.agentReview.terminal"
+    public static let agentReviewAppleTerminalProfileKey = "GHMenuBar.settings.agentReview.appleTerminalProfile"
+    public static let agentReviewCustomTerminalExecutableKey = "GHMenuBar.settings.agentReview.customTerminalExecutable"
+    public static let agentReviewCustomTerminalArgumentsKey = "GHMenuBar.settings.agentReview.customTerminalArguments"
     public static let agentReviewToolKey = "GHMenuBar.settings.agentReview.tool"
     public static let agentReviewToolOverridesKey = "GHMenuBar.settings.agentReview.toolOverrides"
     public static let agentReviewProfilesKey = "GHMenuBar.settings.agentReview.profiles"
@@ -777,6 +861,14 @@ public struct GHMenuBarSettingsStorage {
                 isEnabled: defaults.bool(forKey: Self.agentReviewEnabledKey),
                 supportedRepository: defaults.string(forKey: Self.agentReviewSupportedRepositoryKey) ?? "",
                 workspacePath: defaults.string(forKey: Self.agentReviewWorkspacePathKey) ?? "",
+                terminal: Self.agentReviewTerminal(
+                    from: defaults.string(forKey: Self.agentReviewTerminalKey)
+                ),
+                appleTerminalProfile: defaults.string(forKey: Self.agentReviewAppleTerminalProfileKey)
+                    ?? AgentReviewSettings.defaultAppleTerminalProfile,
+                customTerminalExecutable: defaults.string(forKey: Self.agentReviewCustomTerminalExecutableKey) ?? "",
+                customTerminalArguments: defaults.string(forKey: Self.agentReviewCustomTerminalArgumentsKey)
+                    ?? AgentReviewSettings.defaultCustomTerminalArguments,
                 agentTool: Self.agentReviewTool(
                     from: defaults.string(forKey: Self.agentReviewToolKey)
                 ),
@@ -815,6 +907,19 @@ public struct GHMenuBarSettingsStorage {
         defaults.set(sanitizedSettings.agentReview.isEnabled, forKey: Self.agentReviewEnabledKey)
         defaults.set(sanitizedSettings.agentReview.supportedRepository, forKey: Self.agentReviewSupportedRepositoryKey)
         defaults.set(sanitizedSettings.agentReview.workspacePath, forKey: Self.agentReviewWorkspacePathKey)
+        defaults.set(sanitizedSettings.agentReview.terminal.rawValue, forKey: Self.agentReviewTerminalKey)
+        defaults.set(
+            sanitizedSettings.agentReview.appleTerminalProfile,
+            forKey: Self.agentReviewAppleTerminalProfileKey
+        )
+        defaults.set(
+            sanitizedSettings.agentReview.customTerminalExecutable,
+            forKey: Self.agentReviewCustomTerminalExecutableKey
+        )
+        defaults.set(
+            sanitizedSettings.agentReview.customTerminalArguments,
+            forKey: Self.agentReviewCustomTerminalArgumentsKey
+        )
         defaults.set(sanitizedSettings.agentReview.agentTool.rawValue, forKey: Self.agentReviewToolKey)
         setStringDictionary(
             Self.stringDictionary(from: sanitizedSettings.agentReview.agentToolOverrides),
@@ -831,6 +936,10 @@ public struct GHMenuBarSettingsStorage {
 
     private static func agentReviewTool(from rawValue: String?) -> AgentReviewTool {
         rawValue.flatMap(AgentReviewTool.init(rawValue:)) ?? .claudeCode
+    }
+
+    private static func agentReviewTerminal(from rawValue: String?) -> AgentReviewTerminal {
+        rawValue.flatMap(AgentReviewTerminal.init(rawValue:)) ?? .automatic
     }
 
     private static func menuBarCountScope(from rawValue: String?) -> MenuBarCountScope {

@@ -61,6 +61,10 @@ final class GHMenuBarSettingsTests: XCTestCase {
                 isEnabled: true,
                 supportedRepository: " acme/frontend ",
                 workspacePath: " /Users/example/acme ",
+                terminal: .custom,
+                appleTerminalProfile: " Review Zsh ",
+                customTerminalExecutable: " /opt/example/bin/terminal ",
+                customTerminalArguments: " --new-window\n{script} ",
                 agentTool: .copilot,
                 agentToolOverrides: [
                     " acme/frontend ": .claudeCode,
@@ -112,6 +116,10 @@ final class GHMenuBarSettingsTests: XCTestCase {
                     isEnabled: true,
                     supportedRepository: "acme/frontend",
                     workspacePath: "/Users/example/acme",
+                    terminal: .custom,
+                    appleTerminalProfile: "Review Zsh",
+                    customTerminalExecutable: "/opt/example/bin/terminal",
+                    customTerminalArguments: "--new-window\n{script}",
                     agentTool: .copilot,
                     agentToolOverrides: [
                         "acme/frontend": .claudeCode,
@@ -147,6 +155,19 @@ final class GHMenuBarSettingsTests: XCTestCase {
             GHMenuBarSettingsStorage(defaults: defaults).settings.agentReview.agentTool,
             .claudeCode
         )
+    }
+
+    func testStorageFallsBackToAutomaticForUnknownOrMissingReviewTerminal() throws {
+        let suiteName = "GHMenuBarTests.Settings.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let storage = GHMenuBarSettingsStorage(defaults: defaults)
+
+        XCTAssertEqual(storage.settings.agentReview.terminal, .automatic)
+
+        defaults.set("future-terminal", forKey: GHMenuBarSettingsStorage.agentReviewTerminalKey)
+        XCTAssertEqual(storage.settings.agentReview.terminal, .automatic)
     }
 
     func testRepositoryFilterAppliesOrganizationsIncludeAndExclude() {
@@ -416,8 +437,12 @@ final class GHMenuBarSettingsTests: XCTestCase {
                         pattern: " acme/* ",
                         localReview: .override(AgentReviewLocalWorkflow(
                             agentTool: .claudeCode,
+                            codexModel: " gpt-5.6-sol ",
+                            claudeModel: " claude-opus-5 ",
+                            copilotModel: " auto ",
                             workspacePathTemplate: " ~/acme/{repoName} ",
                             promptRootPathTemplate: " ~/acme ",
+                            worktreeRootPathTemplate: " ~/.reviews/{repoName} ",
                             promptTemplate: " /code-review {pr} "
                         )),
                         cloudReview: .override(AgentReviewCloudWorkflow(
@@ -437,8 +462,12 @@ final class GHMenuBarSettingsTests: XCTestCase {
                     pattern: "acme/*",
                     localReview: .override(AgentReviewLocalWorkflow(
                         agentTool: .claudeCode,
+                        codexModel: "gpt-5.6-sol",
+                        claudeModel: "claude-opus-5",
+                        copilotModel: "auto",
                         workspacePathTemplate: "~/acme/{repoName}",
                         promptRootPathTemplate: "~/acme",
+                        worktreeRootPathTemplate: "~/.reviews/{repoName}",
                         promptTemplate: "/code-review {pr}"
                     )),
                     cloudReview: .override(AgentReviewCloudWorkflow(
@@ -449,6 +478,40 @@ final class GHMenuBarSettingsTests: XCTestCase {
                 )
             ]
         )
+    }
+
+    func testLocalWorkflowRetainsIndependentModelsForEveryRunner() {
+        let workflow = AgentReviewLocalWorkflow(
+            agentTool: .copilot,
+            codexModel: "gpt-5.6-sol",
+            claudeModel: "claude-opus-5",
+            copilotModel: "auto",
+            workspacePathTemplate: "~/work/{repoName}",
+            promptTemplate: "/review {pr}"
+        )
+
+        XCTAssertEqual(workflow.model(for: .codexCLI), "gpt-5.6-sol")
+        XCTAssertEqual(workflow.model(for: .claudeCode), "claude-opus-5")
+        XCTAssertEqual(workflow.model(for: .copilot), "auto")
+    }
+
+    func testLegacyLocalWorkflowJSONDecodesWithoutModelSelections() throws {
+        let data = try XCTUnwrap(
+            """
+            {
+              "agentTool": "copilot",
+              "workspacePathTemplate": "~/work/{repoName}",
+              "promptTemplate": "/review {pr}"
+            }
+            """.data(using: .utf8)
+        )
+
+        let workflow = try JSONDecoder().decode(AgentReviewLocalWorkflow.self, from: data)
+
+        XCTAssertNil(workflow.model(for: .codexCLI))
+        XCTAssertNil(workflow.model(for: .claudeCode))
+        XCTAssertNil(workflow.model(for: .copilot))
+        XCTAssertNil(workflow.worktreeRootPathTemplate)
     }
 
     func testStorageRepairsAndPersistsUniquePathScopeMatchWithoutChangingWorkflow() throws {

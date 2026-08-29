@@ -940,6 +940,12 @@ struct PullRequestSettingsView: View {
 
                 agentReviewSettingsTab
                 .tag(PullRequestSettingsTab.agentReview)
+                .task {
+                    await loadAccountsIfNeeded()
+                }
+                .task(id: draft.organizations.joined(separator: "\u{1F}")) {
+                    await loadRepositoriesForSelectedAccounts()
+                }
                 .tabItem {
                     Label("Agent Review", systemImage: "sparkles")
                 }
@@ -1160,8 +1166,20 @@ struct PullRequestSettingsView: View {
 
     private var agentReviewSettingsTab: some View {
         ScrollView(.vertical) {
-            AgentReviewScopeEditor(scopes: $draft.agentReview.reviewScopes)
-                .padding(.bottom, 4)
+            VStack(alignment: .leading, spacing: 16) {
+                AgentReviewTerminalSettingsPanel(
+                    terminal: $draft.agentReview.terminal,
+                    appleTerminalProfile: $draft.agentReview.appleTerminalProfile,
+                    customTerminalExecutable: $draft.agentReview.customTerminalExecutable,
+                    customTerminalArguments: $draft.agentReview.customTerminalArguments
+                )
+
+                AgentReviewScopeEditor(
+                    scopes: $draft.agentReview.reviewScopes,
+                    availableRepositories: availableRepositories
+                )
+            }
+            .padding(.bottom, 4)
         }
     }
 
@@ -1690,8 +1708,93 @@ private enum AgentReviewPalette {
     static let disabled = Color.secondary
 }
 
+private struct AgentReviewTerminalSettingsPanel: View {
+    @Binding var terminal: AgentReviewTerminal
+    @Binding var appleTerminalProfile: String
+    @Binding var customTerminalExecutable: String
+    @Binding var customTerminalArguments: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .center, spacing: 12) {
+                Label("Review terminal", systemImage: "terminal")
+                    .font(.subheadline.weight(.semibold))
+
+                Spacer()
+
+                Picker("Review terminal", selection: $terminal) {
+                    ForEach(AgentReviewTerminal.allCases) { terminal in
+                        Text(terminal.displayName).tag(terminal)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 190)
+            }
+
+            Text(terminalDetail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if terminal == .appleTerminal {
+                LabeledContent("Session profile") {
+                    TextField("GHMenuBar Review", text: $appleTerminalProfile)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(maxWidth: 300)
+                }
+
+                Text("GHMenuBar creates this temporary Terminal profile for each review and starts /bin/zsh as the tab's shell process. Your default Fish shell is never launched.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if terminal == .custom {
+                LabeledContent("Executable") {
+                    TextField("/absolute/path/to/terminal-cli", text: $customTerminalExecutable)
+                        .textFieldStyle(.roundedBorder)
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Arguments — one per line")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+
+                    TextEditor(text: $customTerminalArguments)
+                        .font(.system(.caption, design: .monospaced))
+                        .scrollContentBackground(.hidden)
+                        .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
+                        .frame(height: 70)
+
+                    Text("Available placeholders: {shell}, {script}, and {workspace}. {script} is required.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(12)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(AgentReviewPalette.local.opacity(0.22), lineWidth: 1)
+        )
+    }
+
+    private var terminalDetail: String {
+        switch terminal {
+        case .automatic:
+            return "Uses Ghostty when installed, then cmux. It never falls back to a default shell that could start Fish."
+        case .ghostty:
+            return "Opens a new Ghostty instance with /bin/zsh as its initial process."
+        case .cmux:
+            return "Creates a cmux workspace whose initial command is /bin/zsh."
+        case .appleTerminal:
+            return "Opens a temporary Terminal profile whose shell process is /bin/zsh."
+        case .custom:
+            return "Launch another terminal through its CLI without passing through your login shell."
+        }
+    }
+}
+
 private struct AgentReviewScopeEditor: View {
     @Binding var scopes: [AgentReviewScopeDraft]
+    let availableRepositories: [String]
     @State private var selectedScopeID: AgentReviewScopeDraft.ID?
 
     var body: some View {
@@ -1699,7 +1802,7 @@ private struct AgentReviewScopeEditor: View {
             scopeSidebar
 
             if let selectedScopeBinding {
-                ScopeSettingsPanel(scope: selectedScopeBinding)
+                ScopeSettingsPanel(scope: selectedScopeBinding, availableRepositories: availableRepositories)
             } else {
                 ContentUnavailableView(
                     "No review scopes",
@@ -1852,6 +1955,9 @@ private struct AgentReviewScopeRow: View {
 
 private struct ScopeSettingsPanel: View {
     @Binding var scope: AgentReviewScopeDraft
+    let availableRepositories: [String]
+    @State private var repositorySearch = ""
+    @State private var isRepositoryPickerPresented = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -1861,6 +1967,66 @@ private struct ScopeSettingsPanel: View {
 
                 TextField("Scope pattern", text: $scope.pattern)
                     .textFieldStyle(.roundedBorder)
+
+                HStack(spacing: 8) {
+                    Button {
+                        repositorySearch = ""
+                        isRepositoryPickerPresented = true
+                    } label: {
+                        Label("Choose repository", systemImage: "list.bullet.rectangle")
+                    }
+                    .disabled(availableRepositories.isEmpty)
+                    .popover(isPresented: $isRepositoryPickerPresented, arrowEdge: .bottom) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            TextField("Search repositories", text: $repositorySearch)
+                                .textFieldStyle(.roundedBorder)
+
+                            Divider()
+
+                            ScrollView {
+                                LazyVStack(alignment: .leading, spacing: 2) {
+                                    if filteredRepositories.isEmpty {
+                                        Text(availableRepositories.isEmpty ? "No repositories loaded yet" : "No matching repositories")
+                                            .foregroundStyle(.secondary)
+                                            .padding(.vertical, 8)
+                                    } else {
+                                        ForEach(filteredRepositories, id: \.self) { repository in
+                                            Button {
+                                                scope.pattern = repository
+                                                isRepositoryPickerPresented = false
+                                            } label: {
+                                                HStack {
+                                                    Text(repository)
+                                                    Spacer()
+                                                    if scope.pattern.caseInsensitiveCompare(repository) == .orderedSame {
+                                                        Image(systemName: "checkmark")
+                                                            .foregroundStyle(.tint)
+                                                    }
+                                                }
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                            }
+                                            .buttonStyle(.plain)
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 4)
+                                        }
+                                    }
+                                }
+                            }
+                            .frame(width: 360, height: 260)
+                        }
+                        .padding(12)
+                    }
+
+                    if availableRepositories.isEmpty {
+                        Text("Load repositories in the Repositories tab to choose one here.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("Choose a loaded repository, or enter a pattern manually.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
 
                 Text("Accepted forms: *, owner/*, or owner/repo.")
                     .font(.caption)
@@ -1886,6 +2052,15 @@ private struct ScopeSettingsPanel: View {
                         }
                     }
 
+                    AgentReviewModelField(
+                        agentTool: scope.localAgentTool,
+                        model: Binding(
+                            get: { scope.model(for: scope.localAgentTool) },
+                            set: { scope.setModel($0, for: scope.localAgentTool) }
+                        )
+                    )
+                    .id(scope.localAgentTool)
+
                     LabeledContent("Workspace") {
                         TextField("Workspace path or template", text: $scope.localWorkspacePathTemplate)
                             .textFieldStyle(.roundedBorder)
@@ -1894,6 +2069,30 @@ private struct ScopeSettingsPanel: View {
                     LabeledContent("Prompt root") {
                         TextField("Optional prompt root path", text: $scope.localPromptRootPathTemplate)
                             .textFieldStyle(.roundedBorder)
+                    }
+
+                    Toggle("Use isolated worktree", isOn: $scope.localUsesWorktree)
+                        .toggleStyle(.checkbox)
+                        .pointingHandCursor()
+
+                    if scope.localUsesWorktree {
+                        LabeledContent("Worktree root") {
+                            TextField(
+                                AgentReviewLocalWorkflow.defaultWorktreeRootPathTemplate,
+                                text: $scope.localWorktreeRootPathTemplate
+                            )
+                            .textFieldStyle(.roundedBorder)
+                        }
+
+                        Text("Each review gets a detached worktree at the exact PR head. GHMenuBar removes it when the review session exits. Supported placeholders: {repo}, {repoName}, {pr}, {workspace}, and {workspaceParent}.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+
+                        if let validationMessage = scope.worktreeRootValidationMessage {
+                            Label(validationMessage, systemImage: "exclamationmark.triangle.fill")
+                                .font(.caption2)
+                                .foregroundStyle(.red)
+                        }
                     }
 
                     VStack(alignment: .leading, spacing: 6) {
@@ -1913,6 +2112,12 @@ private struct ScopeSettingsPanel: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+
+    private var filteredRepositories: [String] {
+        let query = repositorySearch.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return availableRepositories }
+        return availableRepositories.filter { $0.localizedCaseInsensitiveContains(query) }
     }
 }
 
@@ -1958,6 +2163,109 @@ private struct CloudReviewUnavailableCard: View {
         )
         .shadow(color: .black.opacity(0.04), radius: 10, x: 0, y: 5)
         .frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+}
+
+private struct AgentReviewModelField: View {
+    let agentTool: AgentReviewTool
+    @Binding var model: String
+    @State private var options: [AgentReviewModelOption] = []
+    @State private var discoveryError: String?
+    @State private var isLoading = false
+
+    var body: some View {
+        LabeledContent("Model") {
+            VStack(alignment: .trailing, spacing: 4) {
+                HStack(spacing: 6) {
+                    TextField("Use runner default", text: $model)
+                        .textFieldStyle(.roundedBorder)
+
+                    Menu {
+                        Button {
+                            model = ""
+                        } label: {
+                            if normalizedModel.isEmpty {
+                                Label("Runner default", systemImage: "checkmark")
+                            } else {
+                                Text("Runner default")
+                            }
+                        }
+
+                        if !options.isEmpty {
+                            Divider()
+                            ForEach(options) { option in
+                                Button {
+                                    model = option.id
+                                } label: {
+                                    if option.id == normalizedModel {
+                                        Label(optionLabel(option), systemImage: "checkmark")
+                                    } else {
+                                        Text(optionLabel(option))
+                                    }
+                                }
+                            }
+                        }
+
+                        Divider()
+                        Button {
+                            Task { await reloadModels() }
+                        } label: {
+                            Label("Refresh models", systemImage: "arrow.clockwise")
+                        }
+                    } label: {
+                        if isLoading {
+                            ProgressView()
+                                .controlSize(.small)
+                                .frame(width: 18, height: 18)
+                        } else {
+                            Image(systemName: "cpu")
+                                .frame(width: 18, height: 18)
+                        }
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .help("Choose a model detected from \(agentTool.displayName), or enter a model ID")
+                }
+
+                if let discoveryError {
+                    Text(discoveryError)
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                        .multilineTextAlignment(.trailing)
+                } else {
+                    Text("Leave blank to use the runner’s own default.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .task {
+            await reloadModels()
+        }
+    }
+
+    private var normalizedModel: String {
+        model.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func optionLabel(_ option: AgentReviewModelOption) -> String {
+        option.displayName.caseInsensitiveCompare(option.id) == .orderedSame
+            ? option.id
+            : "\(option.displayName) — \(option.id)"
+    }
+
+    @MainActor
+    private func reloadModels() async {
+        isLoading = true
+        discoveryError = nil
+        defer { isLoading = false }
+
+        do {
+            options = try await AgentReviewModelDiscovery().models(for: agentTool)
+        } catch {
+            options = []
+            discoveryError = error.localizedDescription
+        }
     }
 }
 
@@ -2058,6 +2366,10 @@ private struct GHMenuBarSettingsDraft {
                 isEnabled: agentReview.enablesLocalReview,
                 supportedRepository: "",
                 workspacePath: "",
+                terminal: agentReview.terminal,
+                appleTerminalProfile: agentReview.appleTerminalProfile,
+                customTerminalExecutable: agentReview.customTerminalExecutable,
+                customTerminalArguments: agentReview.customTerminalArguments,
                 agentTool: .claudeCode,
                 agentToolOverrides: [:],
                 reviewProfiles: [],
@@ -2069,7 +2381,9 @@ private struct GHMenuBarSettingsDraft {
     }
 
     var canSave: Bool {
-        guard agentReview.hasValidScopePatterns else {
+        guard agentReview.hasValidScopePatterns,
+              agentReview.hasValidWorktreeConfigurations
+        else {
             return false
         }
 
@@ -2154,9 +2468,17 @@ private struct GeneralSettingsDraft {
 }
 
 private struct AgentReviewSettingsDraft {
+    var terminal: AgentReviewTerminal
+    var appleTerminalProfile: String
+    var customTerminalExecutable: String
+    var customTerminalArguments: String
     var reviewScopes: [AgentReviewScopeDraft]
 
     init(settings: GHMenuBarSettings) {
+        terminal = settings.agentReview.terminal
+        appleTerminalProfile = settings.agentReview.appleTerminalProfile
+        customTerminalExecutable = settings.agentReview.customTerminalExecutable
+        customTerminalArguments = settings.agentReview.customTerminalArguments
         if settings.agentReview.reviewScopes.isEmpty {
             reviewScopes = Self.legacyScopes(from: settings)
         } else {
@@ -2175,6 +2497,10 @@ private struct AgentReviewSettingsDraft {
 
     var hasValidScopePatterns: Bool {
         reviewScopes.allSatisfy(\.isPatternValid)
+    }
+
+    var hasValidWorktreeConfigurations: Bool {
+        reviewScopes.allSatisfy { $0.worktreeRootValidationMessage == nil }
     }
 
     private static func repairedStoredScope(
@@ -2306,8 +2632,13 @@ private struct AgentReviewScopeDraft: Identifiable, Equatable {
     var localMode: AgentReviewDraftMode
     var cloudMode: AgentReviewDraftMode
     var localAgentTool: AgentReviewTool
+    var localCodexModel: String
+    var localClaudeModel: String
+    var localCopilotModel: String
     var localWorkspacePathTemplate: String
     var localPromptRootPathTemplate: String
+    var localUsesWorktree: Bool
+    var localWorktreeRootPathTemplate: String
     var localPromptTemplate: String
     var cloudWorkflowName: String
     var cloudTriggerTemplate: String
@@ -2319,8 +2650,13 @@ private struct AgentReviewScopeDraft: Identifiable, Equatable {
         localMode: AgentReviewDraftMode = .inherit,
         cloudMode: AgentReviewDraftMode = .disabled,
         localAgentTool: AgentReviewTool = .codexCLI,
+        localCodexModel: String = "",
+        localClaudeModel: String = "",
+        localCopilotModel: String = "",
         localWorkspacePathTemplate: String = "",
         localPromptRootPathTemplate: String = "",
+        localUsesWorktree: Bool = false,
+        localWorktreeRootPathTemplate: String = AgentReviewLocalWorkflow.defaultWorktreeRootPathTemplate,
         localPromptTemplate: String = "$requesting-code-review {pr}",
         cloudWorkflowName: String = "Codex cloud review",
         cloudTriggerTemplate: String = "@codex review for {pr}",
@@ -2331,8 +2667,13 @@ private struct AgentReviewScopeDraft: Identifiable, Equatable {
         self.localMode = localMode
         self.cloudMode = cloudMode
         self.localAgentTool = localAgentTool
+        self.localCodexModel = localCodexModel
+        self.localClaudeModel = localClaudeModel
+        self.localCopilotModel = localCopilotModel
         self.localWorkspacePathTemplate = localWorkspacePathTemplate
         self.localPromptRootPathTemplate = localPromptRootPathTemplate
+        self.localUsesWorktree = localUsesWorktree
+        self.localWorktreeRootPathTemplate = localWorktreeRootPathTemplate
         self.localPromptTemplate = localPromptTemplate
         self.cloudWorkflowName = cloudWorkflowName
         self.cloudTriggerTemplate = cloudTriggerTemplate
@@ -2373,8 +2714,14 @@ private struct AgentReviewScopeDraft: Identifiable, Equatable {
             localMode: localMode,
             cloudMode: cloudMode,
             localAgentTool: localWorkflow?.agentTool ?? .codexCLI,
+            localCodexModel: localWorkflow?.codexModel ?? "",
+            localClaudeModel: localWorkflow?.claudeModel ?? "",
+            localCopilotModel: localWorkflow?.copilotModel ?? "",
             localWorkspacePathTemplate: localWorkflow?.workspacePathTemplate ?? "",
             localPromptRootPathTemplate: localWorkflow?.promptRootPathTemplate ?? "",
+            localUsesWorktree: localWorkflow?.worktreeRootPathTemplate != nil,
+            localWorktreeRootPathTemplate: localWorkflow?.worktreeRootPathTemplate
+                ?? AgentReviewLocalWorkflow.defaultWorktreeRootPathTemplate,
             localPromptTemplate: localWorkflow?.promptTemplate ?? "$requesting-code-review {pr}",
             cloudWorkflowName: cloudWorkflow?.workflowName ?? "Codex cloud review",
             cloudTriggerTemplate: cloudWorkflow?.triggerTemplate ?? "@codex review for {pr}",
@@ -2429,6 +2776,40 @@ private struct AgentReviewScopeDraft: Identifiable, Equatable {
         patternValidationMessage == nil
     }
 
+    var worktreeRootValidationMessage: String? {
+        guard localMode == .override, localUsesWorktree else { return nil }
+        let normalizedPath = localWorktreeRootPathTemplate.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedPath.isEmpty else {
+            return "Enter a worktree root path."
+        }
+        guard normalizedPath.hasPrefix("/") || normalizedPath.hasPrefix("~/") else {
+            return "Use an absolute or ~/ worktree root path."
+        }
+        return nil
+    }
+
+    func model(for agentTool: AgentReviewTool) -> String {
+        switch agentTool {
+        case .codexCLI:
+            return localCodexModel
+        case .claudeCode:
+            return localClaudeModel
+        case .copilot:
+            return localCopilotModel
+        }
+    }
+
+    mutating func setModel(_ model: String, for agentTool: AgentReviewTool) {
+        switch agentTool {
+        case .codexCLI:
+            localCodexModel = model
+        case .claudeCode:
+            localClaudeModel = model
+        case .copilot:
+            localCopilotModel = model
+        }
+    }
+
     var scope: AgentReviewScope? {
         let normalizedPattern = pattern.trimmingCharacters(in: .whitespacesAndNewlines)
         guard isPatternValid else { return nil }
@@ -2453,8 +2834,12 @@ private struct AgentReviewScopeDraft: Identifiable, Equatable {
         case .override:
             return .override(AgentReviewLocalWorkflow(
                 agentTool: localAgentTool,
+                codexModel: localCodexModel,
+                claudeModel: localClaudeModel,
+                copilotModel: localCopilotModel,
                 workspacePathTemplate: localWorkspacePathTemplate,
                 promptRootPathTemplate: localPromptRootPathTemplate,
+                worktreeRootPathTemplate: localUsesWorktree ? localWorktreeRootPathTemplate : nil,
                 promptTemplate: localPromptTemplate
             ))
         }
