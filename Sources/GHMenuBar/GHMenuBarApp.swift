@@ -210,18 +210,30 @@ final class PullRequestStore: ObservableObject {
     @Published private(set) var settings: GHMenuBarSettings
     @Published var selectedSettingsTab: PullRequestSettingsTab = .general
     @Published private(set) var agentReviewLaunchErrorMessage: String?
+    @Published private(set) var repositoryRefreshErrorMessage: String?
 
     private var client: GitHubCLI
     private var agentReviewLauncher: PullRequestAgentReviewLauncher
     private let settingsStorage: GHMenuBarSettingsStorage
     private let selectedRepositoryMemory: SelectedRepositoryMemory
+    private let pullRequestCache: PullRequestCache
     private var hasLoaded = false
     private var repositories: [String] = []
     private var cachedPullRequestsByRepository: [String: [PullRequest]] = [:]
+    private var cachedPullRequestDatesByRepository: [String: Date] = [:]
+    private var selectedRepositoryLoadTask: Task<Void, Never>?
+    private var repositoryPrefetchTask: Task<Void, Never>?
+    private var repositoryFetches: [String: RepositoryFetch] = [:]
+
+    private struct RepositoryFetch {
+        let id: UUID
+        let task: Task<[PullRequest], Error>
+    }
 
     init(
         settingsStorage: GHMenuBarSettingsStorage = GHMenuBarSettingsStorage(),
-        selectedRepositoryMemory: SelectedRepositoryMemory = SelectedRepositoryMemory()
+        selectedRepositoryMemory: SelectedRepositoryMemory = SelectedRepositoryMemory(),
+        pullRequestCache: PullRequestCache = PullRequestCache()
     ) {
         let settings = settingsStorage.settings
         self.settings = settings
@@ -229,6 +241,7 @@ final class PullRequestStore: ObservableObject {
         self.agentReviewLauncher = PullRequestAgentReviewLauncher(settings: settings.agentReview)
         self.settingsStorage = settingsStorage
         self.selectedRepositoryMemory = selectedRepositoryMemory
+        self.pullRequestCache = pullRequestCache
     }
 
     var menuBarTitle: String {
@@ -303,12 +316,14 @@ final class PullRequestStore: ObservableObject {
 
         do {
             await updateAuthenticationStatus()
+            restoreCachedPullRequests()
             repositories = try await fetchConfiguredRepositories()
             let selection = makeSelection(selectedRepository: selectedRepository)
-            state = .loaded(selection, isLoadingSelectedRepository: true, isBatchRefreshing: false)
+            state = .loaded(selection, isLoadingSelectedRepository: false, isBatchRefreshing: false)
             selectedRepositoryMemory.saveSelectedRepository(selection.selectedRepository)
-            lastUpdated = Date()
+            lastUpdated = selection.selectedRepository.flatMap { cachedPullRequestDatesByRepository[$0] }
             await loadSelectedRepository(force: false)
+            scheduleRepositoryPrefetch(excluding: selection.selectedRepository)
         } catch {
             state = .failed(error.localizedDescription)
             lastUpdated = Date()
@@ -363,9 +378,12 @@ final class PullRequestStore: ObservableObject {
         agentReviewLauncher = PullRequestAgentReviewLauncher(settings: settings.agentReview)
 
         if settings.repositoryFilter != oldSettings.repositoryFilter {
+            selectedRepositoryLoadTask?.cancel()
+            repositoryPrefetchTask?.cancel()
+            repositoryFetches.values.forEach { $0.task.cancel() }
+            repositoryFetches = [:]
             selectedRepositoryMemory.saveSelectedRepository(nil)
             repositories = []
-            cachedPullRequestsByRepository = [:]
             hasLoaded = false
             state = .idle
             lastUpdated = nil
@@ -398,7 +416,9 @@ final class PullRequestStore: ObservableObject {
     }
 
     private func loadSelectedRepositoryFromSelection() {
-        Task {
+        selectedRepositoryLoadTask?.cancel()
+        selectedRepositoryLoadTask = Task { [weak self] in
+            guard let self else { return }
             await loadSelectedRepository(force: false)
         }
     }
@@ -414,30 +434,44 @@ final class PullRequestStore: ObservableObject {
 
     private func loadSelectedRepository(force: Bool) async {
         guard let selectedRepository = selection?.selectedRepository else { return }
+        repositoryRefreshErrorMessage = nil
 
         if !force,
-           let cachedPullRequests = cachedPullRequestsByRepository[selectedRepository],
-           cachedPullRequests.allSatisfy(\.hasReviewMetadata) {
+           hasCompleteCache(for: selectedRepository),
+           isCacheFresh(for: selectedRepository) {
             state = .loaded(makeSelection(selectedRepository: selectedRepository), isLoadingSelectedRepository: false, isBatchRefreshing: isBatchRefreshing)
+            lastUpdated = cachedPullRequestDatesByRepository[selectedRepository]
             return
         }
 
+        // Keep the selected repository and any cached rows visible while the
+        // fresh request is in flight. This avoids a blank loading transition
+        // when moving between repositories.
         state = .loaded(makeSelection(selectedRepository: selectedRepository), isLoadingSelectedRepository: true, isBatchRefreshing: isBatchRefreshing)
 
         do {
-            await updateAuthenticationStatus()
-            let pullRequests = try await client.fetchOpenPullRequests(repository: selectedRepository)
-            cachedPullRequestsByRepository[selectedRepository] = pullRequests
+            _ = try await fetchAndCachePullRequests(repository: selectedRepository)
+            guard !Task.isCancelled else { return }
 
             guard selection?.selectedRepository == selectedRepository else { return }
 
             state = .loaded(makeSelection(selectedRepository: selectedRepository), isLoadingSelectedRepository: false, isBatchRefreshing: isBatchRefreshing)
-            lastUpdated = Date()
+            lastUpdated = cachedPullRequestDatesByRepository[selectedRepository]
         } catch {
             guard selection?.selectedRepository == selectedRepository else { return }
 
-            state = .failed(error.localizedDescription)
-            lastUpdated = Date()
+            repositoryRefreshErrorMessage = error.localizedDescription
+            if cachedPullRequestsByRepository[selectedRepository] != nil {
+                state = .loaded(
+                    makeSelection(selectedRepository: selectedRepository),
+                    isLoadingSelectedRepository: false,
+                    isBatchRefreshing: isBatchRefreshing
+                )
+                lastUpdated = cachedPullRequestDatesByRepository[selectedRepository]
+            } else {
+                state = .failed(error.localizedDescription)
+                lastUpdated = Date()
+            }
         }
     }
 
@@ -453,11 +487,17 @@ final class PullRequestStore: ObservableObject {
             await updateAuthenticationStatus()
             let pullRequests = try await fetchConfiguredOpenPullRequests()
             cachedPullRequestsByRepository = Dictionary(grouping: pullRequests, by: \.repository)
+            let fetchedAt = Date()
+            cachedPullRequestDatesByRepository = Dictionary(
+                uniqueKeysWithValues: cachedPullRequestsByRepository.keys.map { ($0, fetchedAt) }
+            )
+            persistCachedPullRequests()
 
             let selectedRepository = selection.selectedRepository
             state = .loaded(makeSelection(selectedRepository: selectedRepository), isLoadingSelectedRepository: false, isBatchRefreshing: false)
             lastUpdated = Date()
             await loadSelectedRepository(force: false)
+            scheduleRepositoryPrefetch(excluding: selectedRepository)
         } catch {
             state = .failed(error.localizedDescription)
             lastUpdated = Date()
@@ -476,6 +516,10 @@ final class PullRequestStore: ObservableObject {
     }
 
     private func fetchConfiguredRepositories() async throws -> [String] {
+        if let explicitRepositoryCatalog = settings.repositoryFilter.explicitRepositoryCatalog {
+            return explicitRepositoryCatalog
+        }
+
         let organizations = settings.repositoryFilter.organizations
         let repositories: [String]
 
@@ -510,12 +554,91 @@ final class PullRequestStore: ObservableObject {
     }
 
     private func updateAuthenticationStatus() async {
+        let previousLogin = currentUserLogin
         authenticationStatus = await client.authenticationStatus()
 
         if case .authenticated(let login) = authenticationStatus {
             currentUserLogin = login
         } else {
             currentUserLogin = nil
+        }
+
+        if previousLogin?.caseInsensitiveCompare(currentUserLogin ?? "") != .orderedSame {
+            cachedPullRequestsByRepository = [:]
+            cachedPullRequestDatesByRepository = [:]
+        }
+    }
+
+    private func restoreCachedPullRequests() {
+        guard let currentUserLogin else { return }
+        let entries = pullRequestCache.entries(for: currentUserLogin)
+        cachedPullRequestsByRepository = entries.mapValues(\.pullRequests)
+        cachedPullRequestDatesByRepository = entries.mapValues(\.fetchedAt)
+    }
+
+    private func persistCachedPullRequests() {
+        guard let currentUserLogin else { return }
+        let entries = cachedPullRequestsByRepository.reduce(into: [String: PullRequestCacheEntry]()) { result, item in
+            guard let fetchedAt = cachedPullRequestDatesByRepository[item.key] else { return }
+            result[item.key] = PullRequestCacheEntry(fetchedAt: fetchedAt, pullRequests: item.value)
+        }
+        pullRequestCache.save(entries: entries, for: currentUserLogin)
+    }
+
+    private func isCacheFresh(for repository: String, now: Date = Date()) -> Bool {
+        guard let fetchedAt = cachedPullRequestDatesByRepository[repository] else { return false }
+        return now.timeIntervalSince(fetchedAt) < TimeInterval(settings.refreshIntervalSeconds)
+    }
+
+    private func hasCompleteCache(for repository: String) -> Bool {
+        guard let pullRequests = cachedPullRequestsByRepository[repository] else { return false }
+        return pullRequests.allSatisfy(\.hasReviewMetadata)
+    }
+
+    private func fetchAndCachePullRequests(repository: String) async throws -> [PullRequest] {
+        let fetch: RepositoryFetch
+        if let existingFetch = repositoryFetches[repository] {
+            fetch = existingFetch
+        } else {
+            let id = UUID()
+            let client = client
+            let task = Task {
+                try await client.fetchOpenPullRequests(repository: repository)
+            }
+            fetch = RepositoryFetch(id: id, task: task)
+            repositoryFetches[repository] = fetch
+        }
+
+        do {
+            let pullRequests = try await fetch.task.value
+            if repositoryFetches[repository]?.id == fetch.id {
+                repositoryFetches[repository] = nil
+                cachedPullRequestsByRepository[repository] = pullRequests
+                cachedPullRequestDatesByRepository[repository] = Date()
+                persistCachedPullRequests()
+            }
+            return pullRequests
+        } catch {
+            if repositoryFetches[repository]?.id == fetch.id {
+                repositoryFetches[repository] = nil
+            }
+            throw error
+        }
+    }
+
+    private func scheduleRepositoryPrefetch(excluding selectedRepository: String?) {
+        repositoryPrefetchTask?.cancel()
+        let repositoriesToPrefetch = repositories.filter {
+            $0 != selectedRepository && (!hasCompleteCache(for: $0) || !isCacheFresh(for: $0))
+        }
+        guard !repositoriesToPrefetch.isEmpty else { return }
+
+        repositoryPrefetchTask = Task { [weak self] in
+            guard let self else { return }
+            for repository in repositoriesToPrefetch {
+                guard !Task.isCancelled else { return }
+                _ = try? await fetchAndCachePullRequests(repository: repository)
+            }
         }
     }
 }
@@ -778,38 +901,39 @@ struct PullRequestMenuView: View {
             )
         case .failed(let message):
             StateRow(symbol: "exclamationmark.triangle", title: "Could not sync", message: message)
-        case .loaded(let selection, true, _):
+        case .loaded(let selection, true, _) where store.visiblePullRequests.isEmpty:
             LoadingStateRow(
                 title: "Loading \(selection.selectedRepositoryName ?? "repository")",
                 message: "Fetching open pull requests for the selected repository."
             )
-        case .loaded(let selection, false, _) where store.visiblePullRequests.isEmpty:
+        case .loaded(_, false, _) where store.visiblePullRequests.isEmpty:
             EmptyReviewState()
-        case .loaded(_, false, _):
-            let pullRequests = store.visiblePullRequests
-            VStack(alignment: .leading, spacing: 8) {
-                ScrollView(.vertical, showsIndicators: false) {
-                    LazyVStack(alignment: .leading, spacing: 10) {
-                        ForEach(pullRequests) { pullRequest in
-                            PullRequestRow(
-                                pullRequest: pullRequest,
-                                currentUserLogin: store.currentUserLogin,
-                                configuredAgentTool: store.configuredAgentReviewTool(for: pullRequest),
-                                onLaunchAgentReview: { agentTool in
-                                    store.launchAgentReview(for: pullRequest, using: agentTool)
-                                },
-                                onConfigureAgentReview: {
+        case .loaded:
+            pullRequestList(store.visiblePullRequests)
+        }
+    }
+
+    private func pullRequestList(_ pullRequests: [PullRequest]) -> some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            LazyVStack(alignment: .leading, spacing: 10) {
+                ForEach(pullRequests) { pullRequest in
+                    PullRequestRow(
+                        pullRequest: pullRequest,
+                        currentUserLogin: store.currentUserLogin,
+                        configuredAgentTool: store.configuredAgentReviewTool(for: pullRequest),
+                        onLaunchAgentReview: { agentTool in
+                            store.launchAgentReview(for: pullRequest, using: agentTool)
+                        },
+                        onConfigureAgentReview: {
                                     store.selectedSettingsTab = .agentReview
                                     NSApp.activate(ignoringOtherApps: true)
                                     openWindow(id: Self.settingsWindowID)
-                                }
-                            )
                         }
-                    }
+                    )
                 }
-                .frame(height: pullRequestListHeight(for: pullRequests.count))
             }
         }
+        .frame(height: pullRequestListHeight(for: pullRequests.count))
     }
 
     private func pullRequestListHeight(for count: Int) -> CGFloat {
@@ -840,7 +964,7 @@ struct PullRequestMenuView: View {
     }
 
     private var footerPullRequestCountText: String? {
-        guard case .loaded(_, false, _) = store.state,
+        guard case .loaded = store.state,
               !store.visiblePullRequests.isEmpty
         else {
             return nil
@@ -855,7 +979,11 @@ struct PullRequestMenuView: View {
         }
 
         if store.isLoadingSelectedRepository {
-            return "Loading repository..."
+            return store.visiblePullRequests.isEmpty ? "Loading repository..." : "Refreshing repository..."
+        }
+
+        if store.repositoryRefreshErrorMessage != nil {
+            return "Refresh failed — showing cached data"
         }
 
         if let lastUpdated = store.lastUpdated {
@@ -2006,6 +2134,7 @@ private struct ScopeSettingsPanel: View {
                                                 .frame(maxWidth: .infinity, alignment: .leading)
                                             }
                                             .buttonStyle(.plain)
+                                            .pointingHandCursor()
                                             .padding(.horizontal, 6)
                                             .padding(.vertical, 4)
                                         }
@@ -3018,10 +3147,11 @@ struct PullRequestRow: View {
                     Text("#\(pullRequest.number)")
                         .font(.caption2.weight(.semibold).monospacedDigit())
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: true, vertical: false)
                         .lineLimit(1)
                 }
             }
-            .frame(width: 28)
+            .frame(width: 52)
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {

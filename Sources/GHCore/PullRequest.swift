@@ -1,6 +1,6 @@
 import Foundation
 
-public struct PullRequest: Equatable, Identifiable, Sendable {
+public struct PullRequest: Codable, Equatable, Identifiable, Sendable {
     public var id: String { url.absoluteString }
     public var repositoryName: String {
         repository.split(separator: "/").last.map(String.init) ?? repository
@@ -81,7 +81,7 @@ public struct PullRequest: Equatable, Identifiable, Sendable {
     }
 }
 
-public struct PullRequestReviewSummary: Equatable, Sendable {
+public struct PullRequestReviewSummary: Codable, Equatable, Sendable {
     public let approvalCount: Int
     public let hasChangesRequested: Bool
     public let requestedReviewerLogins: [String]
@@ -125,7 +125,7 @@ public struct PullRequestReviewSummary: Equatable, Sendable {
     }
 }
 
-public enum PullRequestCIState: Equatable, Sendable {
+public enum PullRequestCIState: String, Codable, Equatable, Sendable {
     case none
     case pending
     case passing

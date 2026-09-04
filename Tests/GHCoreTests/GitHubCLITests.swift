@@ -773,6 +773,56 @@ final class GitHubCLITests: XCTestCase {
         XCTAssertEqual(memory.selectedRepository, "acme/bravo")
     }
 
+    func testRepositoryFilterProvidesExplicitCatalogWithoutDiscovery() {
+        let filter = RepositoryFilterSettings(
+            organizations: ["acme"],
+            includedRepositories: ["acme/alpha", "other/bravo", "acme/charlie"],
+            excludedRepositories: ["acme/charlie"]
+        )
+
+        XCTAssertEqual(filter.explicitRepositoryCatalog, ["acme/alpha"])
+        XCTAssertNil(RepositoryFilterSettings().explicitRepositoryCatalog)
+    }
+
+    func testPullRequestCachePersistsFullMetadataForMatchingAccount() throws {
+        let suiteName = "GHMenuBarTests.PullRequestCache.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let cache = PullRequestCache(defaults: defaults)
+        let fetchedAt = Date(timeIntervalSince1970: 1_779_000_300)
+        let pullRequest = samplePullRequest(
+            title: "Cached",
+            repository: "acme/alpha",
+            author: "octocat",
+            latestCommitCommittedAt: Date(timeIntervalSince1970: 1_779_000_200),
+            reviewSummary: PullRequestReviewSummary(
+                approvalCount: 1,
+                hasChangesRequested: false,
+                requestedReviewerLogins: ["dariana"],
+                ciState: .passing,
+                reviewSubmittedAtByAuthor: ["dariana": Date(timeIntervalSince1970: 1_779_000_100)],
+                approvedReviewerLogins: ["reviewer"]
+            )
+        )
+
+        cache.save(
+            entries: [
+                "acme/alpha": PullRequestCacheEntry(
+                    fetchedAt: fetchedAt,
+                    pullRequests: [pullRequest]
+                )
+            ],
+            for: "dariana"
+        )
+
+        XCTAssertEqual(
+            cache.entries(for: "DARIANA")["acme/alpha"],
+            PullRequestCacheEntry(fetchedAt: fetchedAt, pullRequests: [pullRequest])
+        )
+        XCTAssertTrue(cache.entries(for: "someone-else").isEmpty)
+    }
+
     func testRepositorySelectionFiltersVisiblePullRequestsRequiringReview() {
         let selection = PullRequestRepositorySelection(pullRequests: [
             samplePullRequest(

@@ -140,6 +140,12 @@ public struct RepositoryFilterSettings: Equatable, Sendable {
         sanitized().includedRepositories.count == 1
     }
 
+    public var explicitRepositoryCatalog: [String]? {
+        let sanitizedFilter = sanitized()
+        guard !sanitizedFilter.includedRepositories.isEmpty else { return nil }
+        return sanitizedFilter.filteredRepositories(sanitizedFilter.includedRepositories)
+    }
+
     private static func owner(from repository: String) -> String {
         repository.split(separator: "/", maxSplits: 1).first.map(String.init) ?? repository
     }
