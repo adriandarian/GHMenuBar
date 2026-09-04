@@ -135,6 +135,67 @@ final class PullRequestAgentReviewLauncherTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.githubLog.path))
     }
 
+    func testCopilotApprovalAddsOneHostSelectedAllowlistedCelebration() throws {
+        let fixture = try makeCopilotGateFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        let script = fixture.launcher.terminalCommandScript(for: fixture.pullRequest)
+        let payloadURL = try reviewPayloadURL(from: script)
+        try writeValidReviewPayload(to: payloadURL)
+
+        let result = try runGeneratedScript(script, input: "c\n", fixture: fixture)
+
+        XCTAssertEqual(result.exitCode, 0, result.output)
+        let payload = try reviewPayload(at: payloadURL)
+        let body = try XCTUnwrap(payload["body"] as? String)
+        let selectedCelebrations = ApprovalCelebration.allowedMarkdownValues.filter(body.contains)
+        XCTAssertEqual(selectedCelebrations.count, 1, body)
+        XCTAssertEqual(body.components(separatedBy: "<!-- ghmenubar-approval-celebration:start -->").count - 1, 1)
+        XCTAssertEqual(body.components(separatedBy: "<!-- ghmenubar-approval-celebration:end -->").count - 1, 1)
+        XCTAssertTrue(result.output.contains("Approval celebration selected from the reviewed allowlist:"))
+        XCTAssertTrue(result.output.contains(selectedCelebrations[0]))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.githubLog.path))
+    }
+
+    func testCopilotApprovalCelebrationIsIdempotentAcrossEditValidation() throws {
+        let fixture = try makeCopilotGateFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        let script = fixture.launcher.terminalCommandScript(for: fixture.pullRequest)
+        let payloadURL = try reviewPayloadURL(from: script)
+        try writeValidReviewPayload(to: payloadURL)
+
+        let result = try runGeneratedScript(script, input: "e\nc\n", fixture: fixture)
+
+        XCTAssertEqual(result.exitCode, 0, result.output)
+        let body = try XCTUnwrap(try reviewPayload(at: payloadURL)["body"] as? String)
+        XCTAssertEqual(body.components(separatedBy: "<!-- ghmenubar-approval-celebration:start -->").count - 1, 1)
+        XCTAssertEqual(ApprovalCelebration.allowedMarkdownValues.filter(body.contains).count, 1)
+    }
+
+    func testCopilotNonApprovalDoesNotReceiveCelebration() throws {
+        let fixture = try makeCopilotGateFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        let script = fixture.launcher.terminalCommandScript(for: fixture.pullRequest)
+        let payloadURL = try reviewPayloadURL(from: script)
+        try """
+        {
+          "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "body": "One non-blocking observation.",
+          "event": "COMMENT",
+          "comments": []
+        }
+        """.write(to: payloadURL, atomically: true, encoding: .utf8)
+
+        let result = try runGeneratedScript(script, input: "c\n", fixture: fixture)
+
+        XCTAssertEqual(result.exitCode, 0, result.output)
+        let body = try XCTUnwrap(try reviewPayload(at: payloadURL)["body"] as? String)
+        XCTAssertEqual(body, "One non-blocking observation.")
+        XCTAssertFalse(result.output.contains("Approval celebration selected from the reviewed allowlist:"))
+    }
+
     func testCopilotEditRunsOnlyAfterExplicitEditChoiceAndReturnsToGate() throws {
         let fixture = try makeCopilotGateFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -1656,6 +1717,11 @@ final class PullRequestAgentReviewLauncherTests: XCTestCase {
         let remainder = script[markerRange.upperBound...]
         let closingQuote = try XCTUnwrap(remainder.firstIndex(of: "'"))
         return URL(fileURLWithPath: String(remainder[..<closingQuote]), isDirectory: false)
+    }
+
+    private func reviewPayload(at url: URL) throws -> [String: Any] {
+        let data = try Data(contentsOf: url)
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
     }
 
     private func writeValidReviewPayload(to url: URL) throws {

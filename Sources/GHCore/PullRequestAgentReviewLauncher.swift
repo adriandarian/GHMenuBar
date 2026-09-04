@@ -308,13 +308,15 @@ public struct PullRequestAgentReviewLauncher: Sendable {
         let prompt = reviewWorktree.map {
             worktreeReviewPrompt(basePrompt, reviewWorktree: $0)
         } ?? basePrompt
+        let approvalCelebration = ApprovalCelebration.random()
         let agentPrompt = agentTool == .copilot
             ? copilotCompatiblePrompt(
                 prompt,
                 for: pullRequest,
                 reviewProfile: reviewProfile,
                 githubCLIExecutable: githubCLIExecutable,
-                reviewDraftPath: reviewDraftPath
+                reviewDraftPath: reviewDraftPath,
+                approvalCelebration: approvalCelebration
             )
             : prompt
         let quotedPrompt = Self.shellQuoted(agentPrompt)
@@ -338,6 +340,7 @@ public struct PullRequestAgentReviewLauncher: Sendable {
                 githubCLIExecutable: githubCLIExecutable,
                 copilotWorkingDirectory: copilotWorkingDirectory,
                 reviewDraftPath: reviewDraftPath,
+                approvalCelebration: approvalCelebration,
                 pullRequest: pullRequest
             )
         }
@@ -377,6 +380,7 @@ public struct PullRequestAgentReviewLauncher: Sendable {
         githubCLIExecutable: String?,
         copilotWorkingDirectory: String?,
         reviewDraftPath: String,
+        approvalCelebration: ApprovalCelebration,
         pullRequest: PullRequest
     ) -> String {
         let workspacePath = reviewProfile?.workspacePath ?? settings.workspacePath
@@ -425,6 +429,7 @@ public struct PullRequestAgentReviewLauncher: Sendable {
             toolName: AgentReviewTool.copilot.displayName
         ))
         review_payload=\(Self.shellQuoted(reviewDraftPath))
+        approval_celebration=\(Self.shellQuoted(approvalCelebration.markdown))
         \(draftCommand)
         review_status=$?
         if (( review_status != 0 )) && [[ ! -s "$review_payload" ]]; then
@@ -447,13 +452,16 @@ public struct PullRequestAgentReviewLauncher: Sendable {
         fi
 
         validate_review_payload() {
-          python3 - "$review_payload" <<'PY'
+          python3 - "$review_payload" "$approval_celebration" <<'PY'
         import json
         import os
         import re
         import sys
 
         payload_path = sys.argv[1]
+        approval_celebration = sys.argv[2]
+        celebration_start = "<!-- ghmenubar-approval-celebration:start -->"
+        celebration_end = "<!-- ghmenubar-approval-celebration:end -->"
 
         def fail(message):
             raise SystemExit(f"review payload {message}")
@@ -482,10 +490,40 @@ public struct PullRequestAgentReviewLauncher: Sendable {
             fail("event is invalid")
         if not isinstance(body, str):
             fail("body must be a string")
-        if event in {"COMMENT", "REQUEST_CHANGES"} and not body.strip():
-            fail(f"{event} requires a non-empty body")
         if not isinstance(comments, list):
             fail("comments must be a list")
+
+        celebration_pattern = re.compile(
+            r"(?:\\n\\n)?"
+            + re.escape(celebration_start)
+            + r"\\n.*?\\n"
+            + re.escape(celebration_end),
+            re.DOTALL,
+        )
+        undecorated_body = celebration_pattern.sub("", body)
+        if event == "APPROVE":
+            celebration_block = (
+                celebration_start
+                + "\\n"
+                + approval_celebration
+                + "\\n"
+                + celebration_end
+            )
+            trimmed_body = undecorated_body.rstrip()
+            payload["body"] = (
+                trimmed_body + "\\n\\n" + celebration_block
+                if trimmed_body
+                else celebration_block
+            )
+        else:
+            normalized_body = (
+                undecorated_body.rstrip()
+                if undecorated_body != body
+                else body
+            )
+            if not normalized_body.strip():
+                fail(f"{event} requires a non-empty body")
+            payload["body"] = normalized_body
 
         allowed_comment_fields = {
             "path",
@@ -588,8 +626,14 @@ public struct PullRequestAgentReviewLauncher: Sendable {
         }
 
         show_review_actions() {
+          local approval_event
+          approval_event=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["event"])' "$review_payload" 2>/dev/null) || approval_event=""
           print -- '\\n============================================================'
           print -- 'REVIEW READY — NOTHING SUBMITTED'
+          if [[ "$approval_event" == "APPROVE" ]]; then
+            print -- '  Approval celebration selected from the reviewed allowlist:'
+            print -r -- "  $approval_celebration"
+          fi
           print -- '  [e] Edit the draft with Copilot'
           print -- '  [s] Submit the draft as shown'
           print -- '  [c] Cancel without submitting'
@@ -675,7 +719,8 @@ public struct PullRequestAgentReviewLauncher: Sendable {
         for pullRequest: PullRequest,
         reviewProfile: ResolvedAgentReviewProfile?,
         githubCLIExecutable: String?,
-        reviewDraftPath: String
+        reviewDraftPath: String,
+        approvalCelebration: ApprovalCelebration
     ) -> String {
         let githubCLIGuidance = githubCLIExecutable.map { _ in
             """
@@ -692,6 +737,8 @@ public struct PullRequestAgentReviewLauncher: Sendable {
         Use the skill's native human-facing draft presentation exactly, including its body, event, score, inline comments, and internal receipt when required. Do not add a raw `Payload` section.
         Silently save the machine-readable JSON payload to `\(reviewDraftPath)` for the host application. Do not print the raw JSON, the file path, or any transport-file status in the user-facing draft.
         The JSON payload must contain only `commit_id`, `body`, `event`, and `comments`. Each inline comment must contain only GitHub's supported `path`, `body`, and location fields (`position`, or `line` plus `side`). For a multi-line range, always include both `start_line` and `start_side`; use the same value as `side` when both endpoints are on that side. Encode a suggested change inside the comment's `body` as a fenced `suggestion` Markdown block; never add a separate `suggestion` JSON field.
+        If the review event is `APPROVE`, end the human-facing review body with exactly this host-selected celebration: \(approvalCelebration.markdown)
+        The celebration came from the host application's closed, reviewed allowlist. Do not replace it with another emoji, meme, image, GIF, or URL. Do not include it for `COMMENT` or `REQUEST_CHANGES`; the host application enforces these rules before submission.
         Finish after the human-facing draft without submitting or asking a second confirmation question. The host application renders the Edit, Submit, and Cancel confirmation gate next. A draft is incomplete until the internal JSON file exists.
         """
         guard let skillName = Self.workspaceSkillName(from: prompt) else {
