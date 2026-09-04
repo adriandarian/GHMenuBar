@@ -12,6 +12,7 @@ public struct PullRequest: Equatable, Identifiable, Sendable {
         reviewSummary != nil
     }
 
+    public let number: Int
     public let title: String
     public let url: URL
     public let repository: String
@@ -22,6 +23,7 @@ public struct PullRequest: Equatable, Identifiable, Sendable {
     public let reviewSummary: PullRequestReviewSummary?
 
     public init(
+        number: Int = 0,
         title: String,
         url: URL,
         repository: String,
@@ -31,6 +33,7 @@ public struct PullRequest: Equatable, Identifiable, Sendable {
         latestCommitCommittedAt: Date? = nil,
         reviewSummary: PullRequestReviewSummary? = nil
     ) {
+        self.number = number
         self.title = title
         self.url = url
         self.repository = repository
@@ -130,6 +133,7 @@ public enum PullRequestCIState: Equatable, Sendable {
 }
 
 struct GitHubPullRequestDTO: Decodable {
+    let number: Int?
     let title: String
     let url: URL
     let repository: Repository?
@@ -185,6 +189,7 @@ struct GitHubPullRequestDTO: Decodable {
 
     func model(repositoryOverride: String? = nil) -> PullRequest {
         PullRequest(
+            number: number ?? 0,
             title: title,
             url: url,
             repository: repositoryOverride ?? repository?.nameWithOwner ?? "",

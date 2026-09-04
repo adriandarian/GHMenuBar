@@ -447,7 +447,144 @@ public struct PullRequestAgentReviewLauncher: Sendable {
         fi
 
         validate_review_payload() {
-          python3 -c 'import json, sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$review_payload"
+          python3 - "$review_payload" <<'PY'
+        import json
+        import os
+        import re
+        import sys
+
+        payload_path = sys.argv[1]
+
+        def fail(message):
+            raise SystemExit(f"review payload {message}")
+
+        with open(payload_path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+
+        if not isinstance(payload, dict):
+            fail("must be a JSON object")
+
+        allowed_payload_fields = {"commit_id", "body", "event", "comments"}
+        unsupported_payload_fields = sorted(set(payload) - allowed_payload_fields)
+        if unsupported_payload_fields:
+            fail(
+                "contains unsupported fields: "
+                + ", ".join(unsupported_payload_fields)
+            )
+
+        commit_id = payload.get("commit_id", "")
+        event = payload.get("event", "")
+        body = payload.get("body")
+        comments = payload.get("comments")
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", commit_id):
+            fail("commit_id must be a full 40-character SHA")
+        if event not in {"APPROVE", "COMMENT", "REQUEST_CHANGES"}:
+            fail("event is invalid")
+        if not isinstance(body, str):
+            fail("body must be a string")
+        if event in {"COMMENT", "REQUEST_CHANGES"} and not body.strip():
+            fail(f"{event} requires a non-empty body")
+        if not isinstance(comments, list):
+            fail("comments must be a list")
+
+        allowed_comment_fields = {
+            "path",
+            "body",
+            "position",
+            "line",
+            "side",
+            "start_line",
+            "start_side",
+            # Older review prompts emitted this convenience field. GitHub's
+            # API does not accept it, so convert it to supported Markdown.
+            "suggestion",
+        }
+
+        def positive_integer(value):
+            return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+        for index, comment in enumerate(comments, start=1):
+            if not isinstance(comment, dict):
+                fail(f"comment {index} must be an object")
+
+            unsupported_comment_fields = sorted(set(comment) - allowed_comment_fields)
+            if unsupported_comment_fields:
+                fail(
+                    f"comment {index} contains unsupported fields: "
+                    + ", ".join(unsupported_comment_fields)
+                )
+
+            path = comment.get("path")
+            comment_body = comment.get("body")
+            if not isinstance(path, str) or not path.strip():
+                fail(f"comment {index} path must be a non-empty string")
+            if not isinstance(comment_body, str) or not comment_body.strip():
+                fail(f"comment {index} body must be a non-empty string")
+
+            has_position = "position" in comment
+            has_line = "line" in comment
+            if has_position == has_line:
+                fail(f"comment {index} must contain exactly one of position or line")
+
+            if has_position:
+                if not positive_integer(comment["position"]):
+                    fail(f"comment {index} position must be a positive integer")
+                location_only_fields = {"side", "start_line", "start_side"} & set(comment)
+                if location_only_fields:
+                    fail(
+                        f"comment {index} cannot combine position with: "
+                        + ", ".join(sorted(location_only_fields))
+                    )
+            else:
+                if not positive_integer(comment["line"]):
+                    fail(f"comment {index} line must be a positive integer")
+                if comment.get("side") not in {"LEFT", "RIGHT"}:
+                    fail(f"comment {index} side must be LEFT or RIGHT")
+                has_start_line = "start_line" in comment
+                has_start_side = "start_side" in comment
+                if has_start_line and not has_start_side:
+                    # A range that names only one side is unambiguous: both
+                    # endpoints belong to that side. Canonicalize this common
+                    # draft omission before sending the payload to GitHub.
+                    comment["start_side"] = comment["side"]
+                    has_start_side = True
+                if has_start_side and not has_start_line:
+                    fail(f"comment {index} start_side requires start_line")
+                if has_start_line:
+                    if not positive_integer(comment["start_line"]):
+                        fail(f"comment {index} start_line must be a positive integer")
+                    if comment["start_line"] > comment["line"]:
+                        fail(f"comment {index} start_line cannot exceed line")
+                    if comment["start_side"] not in {"LEFT", "RIGHT"}:
+                        fail(f"comment {index} start_side must be LEFT or RIGHT")
+
+            suggestion = comment.pop("suggestion", None)
+            if suggestion is not None:
+                if not isinstance(suggestion, str) or not suggestion.strip():
+                    fail(f"comment {index} suggestion must be a non-empty string")
+                if "```" in suggestion:
+                    fail(f"comment {index} suggestion cannot contain a Markdown fence")
+                if "```suggestion" not in comment_body:
+                    comment["body"] = (
+                        comment_body.rstrip()
+                        + "\\n\\n```suggestion\\n"
+                        + suggestion.rstrip()
+                        + "\\n```"
+                    )
+
+        payload["commit_id"] = commit_id.lower()
+        temporary_path = f"{payload_path}.tmp.{os.getpid()}"
+        try:
+            with open(temporary_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+                handle.write("\\n")
+            os.replace(temporary_path, payload_path)
+        finally:
+            try:
+                os.remove(temporary_path)
+            except FileNotFoundError:
+                pass
+        PY
         }
 
         show_review_actions() {
@@ -460,32 +597,9 @@ public struct PullRequestAgentReviewLauncher: Sendable {
         }
 
         submit_review_payload() {
-          local reviewed_head current_head
-          reviewed_head=$(python3 - "$review_payload" <<'PY'
-        import json
-        import re
-        import sys
-
-        with open(sys.argv[1], encoding="utf-8") as handle:
-            payload = json.load(handle)
-
-        commit_id = payload.get("commit_id", "")
-        event = payload.get("event", "")
-        body = payload.get("body")
-        comments = payload.get("comments")
-        if not re.fullmatch(r"[0-9a-fA-F]{40}", commit_id):
-            raise SystemExit("review payload commit_id must be a full 40-character SHA")
-        if event not in {"APPROVE", "COMMENT", "REQUEST_CHANGES"}:
-            raise SystemExit("review payload event is invalid")
-        if not isinstance(body, str):
-            raise SystemExit("review payload body must be a string")
-        if not isinstance(comments, list):
-            raise SystemExit("review payload comments must be a list")
-        if event in {"COMMENT", "REQUEST_CHANGES"} and not comments:
-            raise SystemExit(f"{event} requires at least one inline comment")
-        print(commit_id.lower())
-        PY
-          ) || return $?
+          local reviewed_head current_head submission_output submission_status
+          validate_review_payload || return $?
+          reviewed_head=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["commit_id"])' "$review_payload") || return $?
 
           current_head=$(\(githubCommand) pr view \(Self.shellQuoted(reviewNumber)) \
             --repo \(Self.shellQuoted(pullRequest.repository)) \
@@ -500,15 +614,19 @@ public struct PullRequestAgentReviewLauncher: Sendable {
             return 75
           fi
 
-          \(githubCommand) api \
+          submission_output=$(\(githubCommand) api \
             \(Self.shellQuoted(reviewEndpoint)) \
             --method POST \
-            --input "$review_payload" \
-            -q .id >/dev/null
+            --input "$review_payload" 2>&1)
+          submission_status=$?
+          if (( submission_status != 0 )); then
+            print -r -u2 -- "$submission_output"
+          fi
+          return "$submission_status"
         }
 
         if ! validate_review_payload; then
-          print -u2 -- '\\nThe internal draft is not valid JSON. Choose Edit to correct it or Cancel.'
+          print -u2 -- '\\nThe internal draft is not valid for GitHub submission. Choose Edit to correct it or Cancel.'
         fi
         while true; do
           show_review_actions
@@ -523,20 +641,22 @@ public struct PullRequestAgentReviewLauncher: Sendable {
                 print -u2 -- '\\nGitHub Copilot exited during editing (status '"$review_status"'). Nothing was submitted.'
               fi
               if ! validate_review_payload; then
-                print -u2 -- '\\nThe edited draft is not valid JSON. Edit it again or Cancel.'
+                print -u2 -- '\\nThe edited draft is not valid for GitHub submission. Edit it again or Cancel.'
               fi
               ;;
             s|S|submit|Submit|SUBMIT)
               print -- '\\nRechecking the PR head before submission...'
-              if submit_review_payload; then
+              submit_review_payload
+              review_submit_status=$?
+              if (( review_submit_status == 0 )); then
                 print -- '\\nReview submitted.'
                 exit 0
               fi
-              review_submit_status=$?
               if (( review_submit_status == 75 )); then
                 exit 75
               fi
               print -u2 -- '\\nSubmission failed. Nothing was posted by GHMenuBar.'
+              print -u2 -- 'Choose Edit to correct the draft or Cancel. Retry Submit only after a transient GitHub error.'
               ;;
             c|C|cancel|Cancel|CANCEL|"")
               print -- '\\nReview cancelled. Nothing was submitted.'
@@ -571,6 +691,7 @@ public struct PullRequestAgentReviewLauncher: Sendable {
         Prepare the review draft only. Do not call `gh pr review`, `gh api`, `.agent/scripts/gh-pr-review-post.sh`, or any equivalent posting command.
         Use the skill's native human-facing draft presentation exactly, including its body, event, score, inline comments, and internal receipt when required. Do not add a raw `Payload` section.
         Silently save the machine-readable JSON payload to `\(reviewDraftPath)` for the host application. Do not print the raw JSON, the file path, or any transport-file status in the user-facing draft.
+        The JSON payload must contain only `commit_id`, `body`, `event`, and `comments`. Each inline comment must contain only GitHub's supported `path`, `body`, and location fields (`position`, or `line` plus `side`). For a multi-line range, always include both `start_line` and `start_side`; use the same value as `side` when both endpoints are on that side. Encode a suggested change inside the comment's `body` as a fenced `suggestion` Markdown block; never add a separate `suggestion` JSON field.
         Finish after the human-facing draft without submitting or asking a second confirmation question. The host application renders the Edit, Submit, and Cancel confirmation gate next. A draft is incomplete until the internal JSON file exists.
         """
         guard let skillName = Self.workspaceSkillName(from: prompt) else {

@@ -111,6 +111,7 @@ final class PullRequestAgentReviewLauncherTests: XCTestCase {
         XCTAssertFalse(script.contains("python3 -m json.tool"))
         XCTAssertFalse(script.contains("Continuing interactively"))
         XCTAssertFalse(script.contains("exec copilot"))
+        XCTAssertTrue(script.contains("never add a separate `suggestion` JSON field"))
     }
 
     func testCopilotCancelGateDoesNotContinueOrWriteToGitHub() throws {
@@ -176,8 +177,182 @@ final class PullRequestAgentReviewLauncherTests: XCTestCase {
         XCTAssertEqual(try invocationCount(at: fixture.copilotLog), 1)
         let githubInvocation = try String(contentsOf: fixture.githubLog, encoding: .utf8)
         XCTAssertTrue(githubInvocation.contains(
-            "api repos/acme/frontend/pulls/42/reviews --method POST --input \(payloadURL.path) -q .id"
+            "api repos/acme/frontend/pulls/42/reviews --method POST --input \(payloadURL.path)"
         ))
+    }
+
+    func testCopilotSubmitExitsWhenHeadChangedInsteadOfRedisplayingStaleGate() throws {
+        let fixture = try makeCopilotGateFixture(currentHead: String(repeating: "b", count: 40))
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        let script = fixture.launcher.terminalCommandScript(for: fixture.pullRequest)
+        try writeValidReviewPayload(to: reviewPayloadURL(from: script))
+
+        let result = try runGeneratedScript(script, input: "s\n", fixture: fixture)
+
+        XCTAssertEqual(result.exitCode, 75, result.output)
+        XCTAssertTrue(result.output.contains("PR head changed from"))
+        XCTAssertFalse(result.output.contains("Submission failed. Nothing was posted"))
+        XCTAssertEqual(try invocationCount(at: fixture.copilotLog), 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.githubLog.path))
+    }
+
+    func testCopilotSubmitCanonicalizesLegacySuggestionField() throws {
+        let fixture = try makeCopilotGateFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        let script = fixture.launcher.terminalCommandScript(for: fixture.pullRequest)
+        let payloadURL = try reviewPayloadURL(from: script)
+        try """
+        {
+          "commit_id": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "body": "LGTM",
+          "event": "APPROVE",
+          "comments": [
+            {
+              "path": "Sources/Feature.swift",
+              "line": 12,
+              "side": "RIGHT",
+              "body": "Use the clearer name.",
+              "suggestion": "let clearerName = value"
+            }
+          ]
+        }
+        """.write(to: payloadURL, atomically: true, encoding: .utf8)
+
+        let result = try runGeneratedScript(
+            script,
+            input: "s\n",
+            fixture: fixture
+        )
+
+        XCTAssertEqual(result.exitCode, 0, result.output)
+        XCTAssertTrue(result.output.contains("Review submitted."))
+
+        let payloadData = try Data(contentsOf: payloadURL)
+        let payload = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: payloadData) as? [String: Any]
+        )
+        XCTAssertEqual(payload["commit_id"] as? String, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        let comments = try XCTUnwrap(payload["comments"] as? [[String: Any]])
+        let comment = try XCTUnwrap(comments.first)
+        XCTAssertNil(comment["suggestion"])
+        XCTAssertEqual(
+            comment["body"] as? String,
+            "Use the clearer name.\n\n```suggestion\nlet clearerName = value\n```"
+        )
+    }
+
+    func testCopilotSubmitCanonicalizesMissingStartSideUsingCommentSide() throws {
+        let fixture = try makeCopilotGateFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        let script = fixture.launcher.terminalCommandScript(for: fixture.pullRequest)
+        let payloadURL = try reviewPayloadURL(from: script)
+        try """
+        {
+          "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "body": "Two findings inline.",
+          "event": "COMMENT",
+          "comments": [
+            {
+              "path": "Sources/Feature.swift",
+              "start_line": 11,
+              "line": 12,
+              "side": "RIGHT",
+              "body": "This range needs attention."
+            }
+          ]
+        }
+        """.write(to: payloadURL, atomically: true, encoding: .utf8)
+
+        let result = try runGeneratedScript(
+            script,
+            input: "s\n",
+            fixture: fixture
+        )
+
+        XCTAssertEqual(result.exitCode, 0, result.output)
+        XCTAssertTrue(result.output.contains("Review submitted."))
+
+        let payloadData = try Data(contentsOf: payloadURL)
+        let payload = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: payloadData) as? [String: Any]
+        )
+        let comments = try XCTUnwrap(payload["comments"] as? [[String: Any]])
+        let comment = try XCTUnwrap(comments.first)
+        XCTAssertEqual(comment["start_line"] as? Int, 11)
+        XCTAssertEqual(comment["line"] as? Int, 12)
+        XCTAssertEqual(comment["side"] as? String, "RIGHT")
+        XCTAssertEqual(comment["start_side"] as? String, "RIGHT")
+    }
+
+    func testCopilotSubmitRejectsUnsupportedCommentFieldBeforeGitHub() throws {
+        let fixture = try makeCopilotGateFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        let script = fixture.launcher.terminalCommandScript(for: fixture.pullRequest)
+        let payloadURL = try reviewPayloadURL(from: script)
+        try """
+        {
+          "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "body": "LGTM",
+          "event": "APPROVE",
+          "comments": [
+            {
+              "path": "Sources/Feature.swift",
+              "line": 12,
+              "side": "RIGHT",
+              "body": "Check this.",
+              "unsupported": true
+            }
+          ]
+        }
+        """.write(to: payloadURL, atomically: true, encoding: .utf8)
+
+        let result = try runGeneratedScript(
+            script,
+            input: "s\nc\n",
+            fixture: fixture
+        )
+
+        XCTAssertEqual(result.exitCode, 0, result.output)
+        XCTAssertTrue(result.output.contains("comment 1 contains unsupported fields: unsupported"))
+        XCTAssertTrue(result.output.contains("not valid for GitHub submission"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.githubLog.path))
+    }
+
+    func testCopilotSubmitPreservesGitHubFailureDetails() throws {
+        let fixture = try makeCopilotGateFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        try writeExecutable(
+            """
+            #!/bin/zsh
+            if [[ "$1" == "pr" && "$2" == "view" ]]; then
+              print -r -- 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+              exit 0
+            fi
+            print -u2 -- 'gh: Validation Failed (HTTP 422)'
+            print -u2 -- 'comments[0].line is not part of the diff'
+            exit 1
+            """,
+            to: fixture.bin.appendingPathComponent("gh", isDirectory: false)
+        )
+
+        let script = fixture.launcher.terminalCommandScript(for: fixture.pullRequest)
+        try writeValidReviewPayload(to: reviewPayloadURL(from: script))
+
+        let result = try runGeneratedScript(
+            script,
+            input: "s\nc\n",
+            fixture: fixture
+        )
+
+        XCTAssertEqual(result.exitCode, 0, result.output)
+        XCTAssertTrue(result.output.contains("gh: Validation Failed (HTTP 422)"))
+        XCTAssertTrue(result.output.contains("comments[0].line is not part of the diff"))
+        XCTAssertTrue(result.output.contains("Retry Submit only after a transient GitHub error."))
     }
 
     func testCodexModelSelectionIsPassedToLaunchCommand() {
@@ -1406,7 +1581,7 @@ final class PullRequestAgentReviewLauncherTests: XCTestCase {
         let pullRequest: PullRequest
     }
 
-    private func makeCopilotGateFixture() throws -> CopilotGateFixture {
+    private func makeCopilotGateFixture(currentHead: String = String(repeating: "a", count: 40)) throws -> CopilotGateFixture {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("GHMenuBarApprovalGateTests-\(UUID().uuidString)", isDirectory: true)
         let bin = root.appendingPathComponent("bin", isDirectory: true)
@@ -1434,7 +1609,7 @@ final class PullRequestAgentReviewLauncherTests: XCTestCase {
             """
             #!/bin/zsh
             if [[ "$1" == "pr" && "$2" == "view" ]]; then
-              print -r -- 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+              print -r -- '\(currentHead)'
               exit 0
             fi
             print -r -- "$*" >> "$GHMENUBAR_TEST_GITHUB_LOG"

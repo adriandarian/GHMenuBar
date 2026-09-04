@@ -3009,9 +3009,19 @@ struct PullRequestRow: View {
 
     private var rowContent: some View {
         HStack(alignment: .top, spacing: 10) {
-            Image(systemName: pullRequest.isDraft ? "doc.badge.clock" : "arrow.triangle.pull")
-                .foregroundStyle(pullRequest.isDraft ? Color.secondary : Color.blue)
-                .frame(width: 18)
+            VStack(spacing: 3) {
+                Image(systemName: pullRequest.isDraft ? "doc.badge.clock" : "arrow.triangle.pull")
+                    .foregroundStyle(pullRequest.isDraft ? Color.secondary : Color.blue)
+                    .frame(width: 18)
+
+                if pullRequest.number > 0 {
+                    Text("#\(pullRequest.number)")
+                        .font(.caption2.weight(.semibold).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            .frame(width: 28)
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {

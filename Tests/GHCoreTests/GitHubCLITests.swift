@@ -24,7 +24,7 @@ final class GitHubCLITests: XCTestCase {
                 "--limit", "20",
                 "--sort", "updated",
                 "--order", "desc",
-                "--json", "title,url,repository,author,updatedAt,isDraft"
+                "--json", "number,title,url,repository,author,updatedAt,isDraft"
             ]
         )
     }
@@ -107,7 +107,7 @@ final class GitHubCLITests: XCTestCase {
                 "--limit", "20",
                 "--sort", "updated",
                 "--order", "desc",
-                "--json", "title,url,repository,author,updatedAt,isDraft"
+                "--json", "number,title,url,repository,author,updatedAt,isDraft"
             ]
         )
     }
@@ -153,7 +153,7 @@ final class GitHubCLITests: XCTestCase {
                 "--limit", "20",
                 "--sort", "updated",
                 "--order", "desc",
-                "--json", "title,url,repository,author,updatedAt,isDraft"
+                "--json", "number,title,url,repository,author,updatedAt,isDraft"
             ]
         )
     }
@@ -171,7 +171,7 @@ final class GitHubCLITests: XCTestCase {
                 "--state", "open",
                 "--search", "draft:false",
                 "--limit", "100",
-                "--json", "title,url,author,updatedAt,isDraft,baseRefName,reviewDecision,reviewRequests,latestReviews,statusCheckRollup,commits"
+                "--json", "number,title,url,author,updatedAt,isDraft,baseRefName,reviewDecision,reviewRequests,latestReviews,statusCheckRollup,commits"
             ]
         )
     }
