@@ -211,12 +211,14 @@ final class PullRequestStore: ObservableObject {
     @Published var selectedSettingsTab: PullRequestSettingsTab = .general
     @Published private(set) var agentReviewLaunchErrorMessage: String?
     @Published private(set) var repositoryRefreshErrorMessage: String?
+    @Published private(set) var pullRequestReadState = PullRequestReadState()
 
     private var client: GitHubCLI
     private var agentReviewLauncher: PullRequestAgentReviewLauncher
     private let settingsStorage: GHMenuBarSettingsStorage
     private let selectedRepositoryMemory: SelectedRepositoryMemory
     private let pullRequestCache: PullRequestCache
+    private let pullRequestReadStateMemory: PullRequestReadStateMemory
     private var hasLoaded = false
     private var repositories: [String] = []
     private var cachedPullRequestsByRepository: [String: [PullRequest]] = [:]
@@ -233,7 +235,8 @@ final class PullRequestStore: ObservableObject {
     init(
         settingsStorage: GHMenuBarSettingsStorage = GHMenuBarSettingsStorage(),
         selectedRepositoryMemory: SelectedRepositoryMemory = SelectedRepositoryMemory(),
-        pullRequestCache: PullRequestCache = PullRequestCache()
+        pullRequestCache: PullRequestCache = PullRequestCache(),
+        pullRequestReadStateMemory: PullRequestReadStateMemory = PullRequestReadStateMemory()
     ) {
         let settings = settingsStorage.settings
         self.settings = settings
@@ -242,6 +245,7 @@ final class PullRequestStore: ObservableObject {
         self.settingsStorage = settingsStorage
         self.selectedRepositoryMemory = selectedRepositoryMemory
         self.pullRequestCache = pullRequestCache
+        self.pullRequestReadStateMemory = pullRequestReadStateMemory
     }
 
     var menuBarTitle: String {
@@ -256,7 +260,12 @@ final class PullRequestStore: ObservableObject {
     }
 
     var menuBarNotification: PullRequestMenuBarNotification {
-        return PullRequestMenuBarNotification(count: visiblePullRequests.count)
+        let hasReviewWorkAcrossWatchedRepositories = selection?
+            .hasUnreadPullRequestsRequiringReviewAcrossRepositories(
+                from: currentUserLogin,
+                readState: pullRequestReadState
+            ) ?? false
+        return PullRequestMenuBarNotification(count: hasReviewWorkAcrossWatchedRepositories ? 1 : 0)
     }
 
     var selection: PullRequestRepositorySelection? {
@@ -368,6 +377,24 @@ final class PullRequestStore: ObservableObject {
 
     func clearAgentReviewLaunchError() {
         agentReviewLaunchErrorMessage = nil
+    }
+
+    func isPullRequestRead(_ pullRequest: PullRequest) -> Bool {
+        pullRequestReadState.isRead(pullRequest)
+    }
+
+    func setPullRequest(_ pullRequest: PullRequest, isRead: Bool) {
+        guard let currentUserLogin else { return }
+
+        var updatedState = pullRequestReadState
+        if isRead {
+            updatedState.markRead(pullRequest)
+        } else {
+            updatedState.markUnread(pullRequest)
+        }
+
+        pullRequestReadState = updatedState
+        pullRequestReadStateMemory.save(updatedState, for: currentUserLogin)
     }
 
     func saveSettings(_ newSettings: GHMenuBarSettings) {
@@ -566,6 +593,9 @@ final class PullRequestStore: ObservableObject {
         if previousLogin?.caseInsensitiveCompare(currentUserLogin ?? "") != .orderedSame {
             cachedPullRequestsByRepository = [:]
             cachedPullRequestDatesByRepository = [:]
+            pullRequestReadState = currentUserLogin.map {
+                pullRequestReadStateMemory.state(for: $0)
+            } ?? PullRequestReadState()
         }
     }
 
@@ -920,6 +950,7 @@ struct PullRequestMenuView: View {
                     PullRequestRow(
                         pullRequest: pullRequest,
                         currentUserLogin: store.currentUserLogin,
+                        isRead: store.isPullRequestRead(pullRequest),
                         configuredAgentTool: store.configuredAgentReviewTool(for: pullRequest),
                         onLaunchAgentReview: { agentTool in
                             store.launchAgentReview(for: pullRequest, using: agentTool)
@@ -928,10 +959,14 @@ struct PullRequestMenuView: View {
                                     store.selectedSettingsTab = .agentReview
                                     NSApp.activate(ignoringOtherApps: true)
                                     openWindow(id: Self.settingsWindowID)
+                        },
+                        onSetRead: { isRead in
+                            store.setPullRequest(pullRequest, isRead: isRead)
                         }
                     )
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(height: pullRequestListHeight(for: pullRequests.count))
     }
@@ -1297,7 +1332,6 @@ struct PullRequestSettingsView: View {
             VStack(alignment: .leading, spacing: 16) {
                 AgentReviewTerminalSettingsPanel(
                     terminal: $draft.agentReview.terminal,
-                    appleTerminalProfile: $draft.agentReview.appleTerminalProfile,
                     customTerminalExecutable: $draft.agentReview.customTerminalExecutable,
                     customTerminalArguments: $draft.agentReview.customTerminalArguments
                 )
@@ -1838,7 +1872,6 @@ private enum AgentReviewPalette {
 
 private struct AgentReviewTerminalSettingsPanel: View {
     @Binding var terminal: AgentReviewTerminal
-    @Binding var appleTerminalProfile: String
     @Binding var customTerminalExecutable: String
     @Binding var customTerminalArguments: String
 
@@ -1863,17 +1896,7 @@ private struct AgentReviewTerminalSettingsPanel: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-            if terminal == .appleTerminal {
-                LabeledContent("Session profile") {
-                    TextField("GHMenuBar Review", text: $appleTerminalProfile)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(maxWidth: 300)
-                }
-
-                Text("GHMenuBar creates this temporary Terminal profile for each review and starts /bin/zsh as the tab's shell process. Your default Fish shell is never launched.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            } else if terminal == .custom {
+            if terminal == .custom {
                 LabeledContent("Executable") {
                     TextField("/absolute/path/to/terminal-cli", text: $customTerminalExecutable)
                         .textFieldStyle(.roundedBorder)
@@ -1913,7 +1936,7 @@ private struct AgentReviewTerminalSettingsPanel: View {
         case .cmux:
             return "Creates a cmux workspace whose initial command is /bin/zsh."
         case .appleTerminal:
-            return "Opens a temporary Terminal profile whose shell process is /bin/zsh."
+            return "Opens a Terminal session without importing a temporary profile for each review."
         case .custom:
             return "Launch another terminal through its CLI without passing through your login shell."
         }
@@ -3063,77 +3086,95 @@ private struct EmptyReviewState: View {
 struct PullRequestRow: View {
     let pullRequest: PullRequest
     let currentUserLogin: String?
+    let isRead: Bool
     let configuredAgentTool: AgentReviewTool?
     let onLaunchAgentReview: (AgentReviewTool) -> Void
     let onConfigureAgentReview: () -> Void
+    let onSetRead: (Bool) -> Void
     private static let reviewToolChoices: [AgentReviewTool] = [.claudeCode, .copilot, .codexCLI]
+    private static let reviewActionColumnWidth: CGFloat = 82
+    private static let reviewActionSpacing: CGFloat = 10
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
+        ZStack(alignment: .topTrailing) {
             Button {
                 NSWorkspace.shared.open(pullRequest.url)
             } label: {
-                HStack(alignment: .top, spacing: 10) {
-                    rowContent
-                    Spacer(minLength: 6)
-                }
+                rowContent
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             .buttonStyle(.plain)
             .contentShape(Rectangle())
             .pointingHandCursor()
 
-            VStack(spacing: 8) {
-                if let configuredAgentTool {
-                    HStack(spacing: 0) {
-                        Button {
-                            onLaunchAgentReview(configuredAgentTool)
-                        } label: {
-                            Label("Review", systemImage: "sparkles")
-                        }
-                        .buttonStyle(.borderless)
-                        .pointingHandCursor()
-                        .help("Start review with the default agent: \(configuredAgentTool.displayName)")
+            reviewAction
+                .frame(width: Self.reviewActionColumnWidth, alignment: .trailing)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .padding(.vertical, 4)
+        .contextMenu {
+            Button {
+                onSetRead(!isRead)
+            } label: {
+                Label(
+                    isRead ? "Mark as Unread" : "Mark as Read",
+                    systemImage: isRead ? "circle.fill" : "checkmark.circle"
+                )
+            }
+        }
+    }
 
-                        Menu {
-                            ForEach(Self.reviewToolChoices) { agentTool in
-                                Button {
-                                    onLaunchAgentReview(agentTool)
-                                } label: {
-                                    if agentTool == configuredAgentTool {
-                                        Label("\(agentTool.displayName) (Default)", systemImage: "checkmark")
-                                    } else {
-                                        Text(agentTool.displayName)
-                                    }
-                                }
-                            }
+    @ViewBuilder
+    private var reviewAction: some View {
+        if let configuredAgentTool {
+            HStack(spacing: 0) {
+                Button {
+                    onLaunchAgentReview(configuredAgentTool)
+                } label: {
+                    Label("Review", systemImage: "sparkles")
+                }
+                .buttonStyle(.borderless)
+                .pointingHandCursor()
+                .help("Start review with the default agent: \(configuredAgentTool.displayName)")
+
+                Menu {
+                    ForEach(Self.reviewToolChoices) { agentTool in
+                        Button {
+                            onLaunchAgentReview(agentTool)
                         } label: {
-                            EmptyView()
-                                .frame(width: 8, height: 22)
-                        }
-                        .menuStyle(.borderlessButton)
-                        .pointingHandCursor()
-                        .help("Choose a different review agent")
-                    }
-                    .fixedSize()
-                } else {
-                    Button {
-                        onConfigureAgentReview()
-                    } label: {
-                        Label {
-                            Text("Set Up Review")
-                        } icon: {
-                            Image(systemName: "gearshape")
+                            if agentTool == configuredAgentTool {
+                                Label("\(agentTool.displayName) (Default)", systemImage: "checkmark")
+                            } else {
+                                Text(agentTool.displayName)
+                            }
                         }
                     }
-                    .buttonStyle(.borderless)
-                    .pointingHandCursor()
-                    .help("Configure Agent Review settings")
+                } label: {
+                    EmptyView()
+                        .frame(width: 8, height: 22)
+                }
+                .menuStyle(.borderlessButton)
+                .pointingHandCursor()
+                .help("Choose a different review agent")
+            }
+            .fixedSize()
+        } else {
+            Button {
+                onConfigureAgentReview()
+            } label: {
+                Label {
+                    Text("Set Up Review")
+                } icon: {
+                    Image(systemName: "gearshape")
                 }
             }
-            .font(.caption)
-            .foregroundStyle(.secondary)
+            .buttonStyle(.borderless)
+            .pointingHandCursor()
+            .help("Configure Agent Review settings")
+            .fixedSize()
         }
-        .padding(.vertical, 4)
     }
 
     private var rowContent: some View {
@@ -3167,7 +3208,17 @@ struct PullRequestRow: View {
                             .padding(.vertical, 2)
                             .background(.quaternary, in: Capsule())
                     }
+
+                    if isRead {
+                        Text("Read")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(.quaternary, in: Capsule())
+                    }
                 }
+                .padding(.trailing, Self.reviewActionColumnWidth + Self.reviewActionSpacing)
 
                 Text(pullRequest.rowByline)
                     .font(.caption)
@@ -3180,7 +3231,9 @@ struct PullRequestRow: View {
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private static let relativeFormatter: RelativeDateTimeFormatter = {

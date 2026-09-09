@@ -106,6 +106,22 @@ public struct PullRequestRepositorySelection: Equatable, Sendable {
         visiblePullRequests.contains { $0.needsReview(from: login) }
     }
 
+    /// Returns review work across every repository in the current watch scope.
+    /// The selected repository remains the only repository shown in the menu;
+    /// this broader query is for global indicators such as the menu-bar dot.
+    public func hasPullRequestsRequiringReviewAcrossRepositories(from login: String?) -> Bool {
+        pullRequests.contains { $0.needsReview(from: login) }
+    }
+
+    public func hasUnreadPullRequestsRequiringReviewAcrossRepositories(
+        from login: String?,
+        readState: PullRequestReadState
+    ) -> Bool {
+        pullRequests.contains {
+            $0.needsReview(from: login) && !readState.isRead($0)
+        }
+    }
+
     public var hasMultipleRepositories: Bool {
         repositories.count > 1
     }

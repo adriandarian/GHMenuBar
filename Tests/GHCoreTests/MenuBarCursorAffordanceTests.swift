@@ -164,6 +164,26 @@ final class MenuBarCursorAffordanceTests: XCTestCase {
         )
     }
 
+    func testPullRequestRowsReserveAnAlignedTrailingReviewColumn() throws {
+        let sourceURL = try packageRoot().appendingPathComponent("Sources/GHMenuBar/GHMenuBarApp.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+
+        XCTAssertTrue(source.contains("ZStack(alignment: .topTrailing)"))
+        XCTAssertTrue(source.contains(".frame(width: Self.reviewActionColumnWidth, alignment: .trailing)"))
+        XCTAssertTrue(source.contains(".padding(.trailing, Self.reviewActionColumnWidth + Self.reviewActionSpacing)"))
+        XCTAssertTrue(source.contains(".frame(maxWidth: .infinity, alignment: .topLeading)"))
+    }
+
+    func testPullRequestRowsOfferReadAndUnreadContextMenuActions() throws {
+        let sourceURL = try packageRoot().appendingPathComponent("Sources/GHMenuBar/GHMenuBarApp.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+
+        XCTAssertTrue(source.contains(".contextMenu {"))
+        XCTAssertTrue(source.contains("onSetRead(!isRead)"))
+        XCTAssertTrue(source.contains("isRead ? \"Mark as Unread\" : \"Mark as Read\""))
+        XCTAssertTrue(source.contains("store.setPullRequest(pullRequest, isRead: isRead)"))
+    }
+
     func testConfiguredReviewActionOffersEveryAgentAndMarksTheDefault() throws {
         let sourceURL = try packageRoot().appendingPathComponent("Sources/GHMenuBar/GHMenuBarApp.swift")
         let source = try String(contentsOf: sourceURL, encoding: .utf8)
@@ -172,7 +192,8 @@ final class MenuBarCursorAffordanceTests: XCTestCase {
         XCTAssertTrue(source.contains("ForEach(Self.reviewToolChoices) { agentTool in"))
         XCTAssertTrue(source.contains("Label(\"\\(agentTool.displayName) (Default)\", systemImage: \"checkmark\")"))
         XCTAssertTrue(source.contains("onLaunchAgentReview(configuredAgentTool)"))
-        XCTAssertTrue(source.contains("EmptyView()\n                                .frame(width: 8, height: 22)"))
+        XCTAssertTrue(source.contains("EmptyView()"))
+        XCTAssertTrue(source.contains(".frame(width: 8, height: 22)"))
         XCTAssertTrue(source.contains(".menuStyle(.borderlessButton)"))
     }
 

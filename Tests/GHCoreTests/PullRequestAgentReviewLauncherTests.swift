@@ -242,20 +242,38 @@ final class PullRequestAgentReviewLauncherTests: XCTestCase {
         ))
     }
 
-    func testCopilotSubmitExitsWhenHeadChangedInsteadOfRedisplayingStaleGate() throws {
+    func testCopilotSubmitAutomaticallyRereviewsLatestHeadWithoutPostingStaleDraft() throws {
         let fixture = try makeCopilotGateFixture(currentHead: String(repeating: "b", count: 40))
         defer { try? FileManager.default.removeItem(at: fixture.root) }
 
         let script = fixture.launcher.terminalCommandScript(for: fixture.pullRequest)
-        try writeValidReviewPayload(to: reviewPayloadURL(from: script))
+        let payloadURL = try reviewPayloadURL(from: script)
+        try writeValidReviewPayload(to: payloadURL)
+        try writeExecutable(
+            """
+            #!/bin/zsh
+            print -r -- 'invoked' >> "$GHMENUBAR_TEST_COPILOT_LOG"
+            invocation_count=$(wc -l < "$GHMENUBAR_TEST_COPILOT_LOG" | tr -d ' ')
+            if (( invocation_count >= 2 )); then
+              print -r -- '{"commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","body":"Reviewed the updated head.","event":"APPROVE","comments":[]}' > '\(payloadURL.path)'
+            fi
+            exit 0
+            """,
+            to: fixture.bin.appendingPathComponent("copilot", isDirectory: false)
+        )
 
-        let result = try runGeneratedScript(script, input: "s\n", fixture: fixture)
+        let result = try runGeneratedScript(script, input: "s\ns\n", fixture: fixture)
 
-        XCTAssertEqual(result.exitCode, 75, result.output)
+        XCTAssertEqual(result.exitCode, 0, result.output)
         XCTAssertTrue(result.output.contains("PR head changed from"))
+        XCTAssertTrue(result.output.contains("automatic review of the latest head"))
+        XCTAssertTrue(result.output.contains("Re-running GitHub Copilot against the latest PR head"))
+        XCTAssertTrue(result.output.contains("Review submitted."))
         XCTAssertFalse(result.output.contains("Submission failed. Nothing was posted"))
-        XCTAssertEqual(try invocationCount(at: fixture.copilotLog), 1)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.githubLog.path))
+        XCTAssertFalse(result.output.contains("Start a new review"))
+        XCTAssertEqual(try invocationCount(at: fixture.copilotLog), 2)
+        XCTAssertEqual(try invocationCount(at: fixture.githubLog), 1)
+        XCTAssertEqual(try reviewPayload(at: payloadURL)["commit_id"] as? String, String(repeating: "b", count: 40))
     }
 
     func testCopilotSubmitCanonicalizesLegacySuggestionField() throws {
@@ -413,7 +431,84 @@ final class PullRequestAgentReviewLauncherTests: XCTestCase {
         XCTAssertEqual(result.exitCode, 0, result.output)
         XCTAssertTrue(result.output.contains("gh: Validation Failed (HTTP 422)"))
         XCTAssertTrue(result.output.contains("comments[0].line is not part of the diff"))
-        XCTAssertTrue(result.output.contains("Retry Submit only after a transient GitHub error."))
+        XCTAssertTrue(result.output.contains("GitHub could not attach at least one inline comment"))
+        XCTAssertTrue(result.output.contains("[b] Preserve inline findings in the review body"))
+        XCTAssertFalse(result.output.contains("Retry Submit only after a transient GitHub error."))
+    }
+
+    func testCopilotLocationFailureCanPreserveInlineFindingsInBodyBeforeResubmission() throws {
+        let fixture = try makeCopilotGateFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        try writeExecutable(
+            """
+            #!/bin/zsh
+            if [[ "$1" == "pr" && "$2" == "view" ]]; then
+              print -r -- 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+              exit 0
+            fi
+            print -r -- "$*" >> "$GHMENUBAR_TEST_GITHUB_LOG"
+            invocation_count=$(wc -l < "$GHMENUBAR_TEST_GITHUB_LOG" | tr -d ' ')
+            if [[ "$invocation_count" == "1" ]]; then
+              print -u2 -- '{"message":"Unprocessable Entity","errors":["Line could not be resolved"]}'
+              print -u2 -- 'gh: Unprocessable Entity (HTTP 422)'
+              exit 1
+            fi
+            print -r -- '12345'
+            """,
+            to: fixture.bin.appendingPathComponent("gh", isDirectory: false)
+        )
+
+        let script = fixture.launcher.terminalCommandScript(for: fixture.pullRequest)
+        let payloadURL = try reviewPayloadURL(from: script)
+        try """
+        {
+          "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "body": "Two findings need attention.",
+          "event": "REQUEST_CHANGES",
+          "comments": [
+            {
+              "path": "Sources/Feature.swift",
+              "line": 25,
+              "side": "RIGHT",
+              "body": "Preserve the blocking finding."
+            },
+            {
+              "path": "Sources/Feature.swift",
+              "line": 10,
+              "side": "LEFT",
+              "body": "Preserve the second finding."
+            }
+          ]
+        }
+        """.write(to: payloadURL, atomically: true, encoding: .utf8)
+
+        let result = try runGeneratedScript(
+            script,
+            input: "s\nb\ns\n",
+            fixture: fixture
+        )
+
+        XCTAssertEqual(result.exitCode, 0, result.output)
+        XCTAssertTrue(result.output.contains("Line could not be resolved"))
+        XCTAssertTrue(result.output.contains("UPDATED REVIEW DRAFT — NOTHING SUBMITTED"))
+        XCTAssertTrue(result.output.contains("Inline comments: 0 (preserved in the body above)"))
+        XCTAssertTrue(result.output.contains("Review submitted."))
+
+        let payload = try reviewPayload(at: payloadURL)
+        let comments = try XCTUnwrap(payload["comments"] as? [[String: Any]])
+        XCTAssertTrue(comments.isEmpty)
+        let body = try XCTUnwrap(payload["body"] as? String)
+        XCTAssertTrue(body.contains("`Sources/Feature.swift:25` (RIGHT)"))
+        XCTAssertTrue(body.contains("Preserve the blocking finding."))
+        XCTAssertTrue(body.contains("`Sources/Feature.swift:10` (LEFT)"))
+        XCTAssertTrue(body.contains("Preserve the second finding."))
+        XCTAssertEqual(
+            try String(contentsOf: fixture.githubLog, encoding: .utf8)
+                .split(whereSeparator: \.isNewline)
+                .count,
+            2
+        )
     }
 
     func testCodexModelSelectionIsPassedToLaunchCommand() {
@@ -999,7 +1094,7 @@ final class PullRequestAgentReviewLauncherTests: XCTestCase {
         XCTAssertTrue(arguments.last?.hasSuffix(".command'") == true)
     }
 
-    func testAppleTerminalUsesTemporaryProfileWithZshAsTheShellProcess() async throws {
+    func testAppleTerminalWaitsForPromptThenRunsReviewScriptWithZsh() async throws {
         let runner = CapturingProcessRunner(results: [
             ProcessResult(
                 stdout: "AGENT=/opt/homebrew/bin/copilot\nGH=/opt/homebrew/bin/gh\n",
@@ -1016,7 +1111,6 @@ final class PullRequestAgentReviewLauncherTests: XCTestCase {
                 supportedRepository: "acme/frontend",
                 workspacePath: "/Users/example/acme",
                 terminal: .appleTerminal,
-                appleTerminalProfile: "Review Zsh",
                 agentTool: .copilot
             ),
             runner: runner,
@@ -1027,32 +1121,25 @@ final class PullRequestAgentReviewLauncherTests: XCTestCase {
 
         try await launcher.launchReview(for: samplePullRequest(repository: "acme/frontend", number: 42))
 
-        XCTAssertEqual(runner.invocations.map(\.executable), ["/bin/zsh", "/usr/bin/open"])
+        XCTAssertEqual(runner.invocations.map(\.executable), ["/bin/zsh", "/usr/bin/osascript"])
         XCTAssertEqual(runner.invocations[0].arguments.first, "-lc")
         XCTAssertTrue(runner.invocations[0].arguments.last?.contains("command -v -- copilot") == true)
         XCTAssertTrue(runner.invocations[0].arguments.last?.contains("command -v -- gh") == true)
         let arguments = runner.invocations[1].arguments
-        XCTAssertEqual(Array(arguments.prefix(2)), ["-a", "Terminal"])
-        let profileURL = URL(fileURLWithPath: try XCTUnwrap(arguments.last))
-        XCTAssertEqual(profileURL.pathExtension, "terminal")
-
-        let profileData = try Data(contentsOf: profileURL)
-        let profile = try XCTUnwrap(
-            PropertyListSerialization.propertyList(
-                from: profileData,
-                options: [],
-                format: nil
-            ) as? [String: Any]
-        )
-        XCTAssertEqual(profile["name"] as? String, "Review Zsh")
-        XCTAssertEqual(profile["RunCommandAsShell"] as? Bool, true)
-        XCTAssertEqual(profile["type"] as? String, "Window Settings")
-        let command = try XCTUnwrap(profile["CommandString"] as? String)
+        XCTAssertEqual(Array(arguments.prefix(3)), ["-l", "JavaScript", "-e"])
+        let launchJavaScript = try XCTUnwrap(arguments.dropFirst(3).first)
+        XCTAssertTrue(launchJavaScript.contains("const reviewTab = terminal.doScript(\"\")"))
+        XCTAssertTrue(launchJavaScript.contains("promptPattern.test(reviewTab.contents())"))
+        XCTAssertTrue(launchJavaScript.contains("terminal.doScript(commandToRun, { in: reviewTab })"))
+        XCTAssertTrue(launchJavaScript.contains("/bin/zsh '"))
+        XCTAssertTrue(launchJavaScript.contains("delay(0.1)"))
+        let command = try XCTUnwrap(arguments.last)
         XCTAssertTrue(command.hasSuffix(".command"))
-        XCTAssertFalse(command.contains("'"))
-        XCTAssertFalse(command.contains("\""))
-        XCTAssertFalse(command.contains("fish"))
         XCTAssertTrue(FileManager.default.isExecutableFile(atPath: command))
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: scriptDirectory.path)
+                .contains(where: { $0.hasSuffix(".terminal") })
+        )
         let script = try String(contentsOfFile: command, encoding: .utf8)
         XCTAssertTrue(script.hasPrefix("#!/bin/zsh\n"))
         XCTAssertTrue(script.contains("export PATH='/opt/homebrew/bin':\"$PATH\""))
@@ -1520,6 +1607,153 @@ final class PullRequestAgentReviewLauncherTests: XCTestCase {
         )
     }
 
+    func testCopilotStaleHeadRecreatesWorktreeAndRereviewsWithoutTouchingSourceCheckout() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("GHMenuBarWorktreeRereviewTests-\(UUID().uuidString)", isDirectory: true)
+        let repository = root.appendingPathComponent("frontend", isDirectory: true)
+        let remote = root.appendingPathComponent("frontend.git", isDirectory: true)
+        let worktreeRoot = root.appendingPathComponent("review-worktrees", isDirectory: true)
+        let launcherDirectory = root.appendingPathComponent("launcher", isDirectory: true)
+        let bin = root.appendingPathComponent("bin", isDirectory: true)
+        let agentLog = root.appendingPathComponent("agent.log", isDirectory: false)
+        let githubLog = root.appendingPathComponent("github.log", isDirectory: false)
+        let headLookupLog = root.appendingPathComponent("head-lookups.log", isDirectory: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try FileManager.default.createDirectory(at: repository, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: launcherDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        try runGit(["init", "--bare", remote.path], in: root)
+        try runGit(["init", "-b", "main"], in: repository)
+        try runGit(["config", "user.name", "GHMenuBar Tests"], in: repository)
+        try runGit(["config", "user.email", "tests@example.invalid"], in: repository)
+        try "base\n".write(
+            to: repository.appendingPathComponent("review.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try runGit(["add", "review.txt"], in: repository)
+        try runGit(["commit", "-m", "base"], in: repository)
+        try runGit(["remote", "add", "origin", remote.path], in: repository)
+        try runGit(["push", "-u", "origin", "main"], in: repository)
+        let sourceHead = try runGit(["rev-parse", "HEAD"], in: repository)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        try runGit(["switch", "-c", "feature"], in: repository)
+        try "pull request v1\n".write(
+            to: repository.appendingPathComponent("review.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try runGit(["commit", "-am", "pull request v1"], in: repository)
+        let firstHead = try runGit(["rev-parse", "HEAD"], in: repository)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        try runGit(["push", "origin", "HEAD:refs/pull/42/head"], in: repository)
+
+        try "pull request v2\n".write(
+            to: repository.appendingPathComponent("review.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try runGit(["commit", "-am", "pull request v2"], in: repository)
+        let secondHead = try runGit(["rev-parse", "HEAD"], in: repository)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        try runGit(["push", "origin", "HEAD:refs/heads/feature"], in: repository)
+        try runGit(["switch", "main"], in: repository)
+
+        let launcher = PullRequestAgentReviewLauncher(
+            settings: AgentReviewSettings(
+                isEnabled: true,
+                supportedRepository: "",
+                workspacePath: "",
+                reviewScopes: [
+                    AgentReviewScope(
+                        pattern: "acme/frontend",
+                        localReview: .override(AgentReviewLocalWorkflow(
+                            agentTool: .copilot,
+                            workspacePathTemplate: repository.path,
+                            worktreeRootPathTemplate: worktreeRoot.path,
+                            promptTemplate: "/review {pr} {workspacePath}"
+                        )),
+                        cloudReview: .disabled
+                    )
+                ]
+            ),
+            scriptDirectory: launcherDirectory
+        )
+        let script = launcher.terminalCommandScript(for: samplePullRequest(
+            repository: "acme/frontend",
+            number: 42
+        ))
+        let worktreePath = try shellAssignment(named: "review_worktree", in: script)
+        let payloadURL = try reviewPayloadURL(from: script)
+
+        try writeExecutable(
+            """
+            #!/bin/zsh
+            if [[ "$1" == "pr" && "$2" == "view" ]]; then
+              print -r -- 'view' >> "$GHMENUBAR_TEST_HEAD_LOOKUP_LOG"
+              lookup_count=$(wc -l < "$GHMENUBAR_TEST_HEAD_LOOKUP_LOG" | tr -d ' ')
+              if (( lookup_count <= 2 )); then
+                print -r -- '\(firstHead)'
+              else
+                if (( lookup_count == 3 )); then
+                  /usr/bin/git --git-dir='\(remote.path)' update-ref refs/pull/42/head '\(secondHead)' || exit $?
+                fi
+                print -r -- '\(secondHead)'
+              fi
+              exit 0
+            fi
+            print -r -- "$*" >> "$GHMENUBAR_TEST_GITHUB_LOG"
+            print -r -- '12345'
+            """,
+            to: bin.appendingPathComponent("gh", isDirectory: false)
+        )
+        try writeExecutable(
+            """
+            #!/bin/zsh
+            reviewed_head=$(/usr/bin/git -C '\(worktreePath)' rev-parse HEAD) || exit $?
+            print -r -- "$reviewed_head" >> "$GHMENUBAR_TEST_AGENT_LOG"
+            print -r -- '{"commit_id":"'"$reviewed_head"'","body":"Reviewed current worktree.","event":"APPROVE","comments":[]}' > '\(payloadURL.path)'
+            """,
+            to: bin.appendingPathComponent("copilot", isDirectory: false)
+        )
+
+        let result = try runGeneratedScript(
+            script,
+            input: "s\ns\n",
+            environment: [
+                "PATH": "\(bin.path):/usr/bin:/bin",
+                "GHMENUBAR_TEST_AGENT_LOG": agentLog.path,
+                "GHMENUBAR_TEST_GITHUB_LOG": githubLog.path,
+                "GHMENUBAR_TEST_HEAD_LOOKUP_LOG": headLookupLog.path
+            ]
+        )
+
+        XCTAssertEqual(result.exitCode, 0, result.output)
+        XCTAssertEqual(
+            try String(contentsOf: agentLog, encoding: .utf8)
+                .split(whereSeparator: \.isNewline)
+                .map(String.init),
+            [firstHead, secondHead]
+        )
+        XCTAssertTrue(result.output.contains("Refreshing the isolated review workspace"))
+        XCTAssertTrue(result.output.contains("Review submitted."))
+        XCTAssertFalse(result.output.contains("Start a new review"))
+        XCTAssertEqual(try invocationCount(at: githubLog), 1)
+        XCTAssertEqual(
+            try runGit(["branch", "--show-current"], in: repository)
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            "main"
+        )
+        XCTAssertEqual(
+            try runGit(["rev-parse", "HEAD"], in: repository)
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            sourceHead
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: worktreePath))
+    }
+
     private func worktreeLauncher(
         repository: URL,
         worktreeRoot: URL,
@@ -1576,6 +1810,7 @@ final class PullRequestAgentReviewLauncherTests: XCTestCase {
 
     private func runGeneratedScript(
         _ script: String,
+        input: String = "",
         environment: [String: String]
     ) throws -> (exitCode: Int32, output: String) {
         let scriptURL = FileManager.default.temporaryDirectory
@@ -1589,10 +1824,14 @@ final class PullRequestAgentReviewLauncherTests: XCTestCase {
         process.environment = ProcessInfo.processInfo.environment.merging(environment) { _, configured in
             configured
         }
+        let inputPipe = Pipe()
         let outputPipe = Pipe()
+        process.standardInput = inputPipe
         process.standardOutput = outputPipe
         process.standardError = outputPipe
         try process.run()
+        inputPipe.fileHandleForWriting.write(Data(input.utf8))
+        try inputPipe.fileHandleForWriting.close()
         let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         return (process.terminationStatus, String(decoding: output, as: UTF8.self))

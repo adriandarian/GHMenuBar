@@ -895,6 +895,31 @@ final class GitHubCLITests: XCTestCase {
         XCTAssertTrue(selection.hasVisiblePullRequestsRequiringReview(from: "dariana"))
     }
 
+    func testReviewIndicatorIncludesWatchedRepositoriesOutsideSelectedRepository() {
+        let selection = PullRequestRepositorySelection(
+            pullRequests: [
+                samplePullRequest(title: "Approved", repository: "acme/alpha", reviewSummary: PullRequestReviewSummary(
+                    approvalCount: 1,
+                    hasChangesRequested: false,
+                    requestedReviewerLogins: [],
+                    ciState: .passing,
+                    reviewSubmittedAtByAuthor: ["dariana": Date(timeIntervalSince1970: 100)]
+                )),
+                samplePullRequest(title: "Needs review", repository: "acme/bravo", author: "octocat", reviewSummary: PullRequestReviewSummary(
+                    approvalCount: 0,
+                    hasChangesRequested: false,
+                    requestedReviewerLogins: ["dariana"],
+                    ciState: .passing,
+                    reviewSubmittedAtByAuthor: [:]
+                ))
+            ],
+            selectedRepository: "acme/alpha"
+        )
+
+        XCTAssertFalse(selection.hasVisiblePullRequestsRequiringReview(from: "dariana"))
+        XCTAssertTrue(selection.hasPullRequestsRequiringReviewAcrossRepositories(from: "dariana"))
+    }
+
     func testMenuBarNotificationShowsNoIndicatorWhenCountIsZero() {
         XCTAssertEqual(
             PullRequestMenuBarNotification(count: 0),

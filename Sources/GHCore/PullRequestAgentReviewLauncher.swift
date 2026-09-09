@@ -206,7 +206,12 @@ public struct PullRequestAgentReviewLauncher: Sendable {
                 for: pullRequest,
                 githubCLIExecutable: githubCLIExecutable
             ) + "\n"
-        } ?? ""
+        } ?? """
+        refresh_review_context() {
+          return 0
+        }
+
+        """
         let commandWorkspaceSetup = reviewWorktree == nil
             ? ""
             : "cd \(Self.shellQuoted(commandWorkspacePath)) || exit $?\n"
@@ -430,26 +435,6 @@ public struct PullRequestAgentReviewLauncher: Sendable {
         ))
         review_payload=\(Self.shellQuoted(reviewDraftPath))
         approval_celebration=\(Self.shellQuoted(approvalCelebration.markdown))
-        \(draftCommand)
-        review_status=$?
-        if (( review_status != 0 )) && [[ ! -s "$review_payload" ]]; then
-          print -u2 -- '\\nGitHub Copilot could not prepare the review draft (status '"$review_status"').'
-          print -u2 -- 'The output above contains the original failure. Fix it, then launch the review again.'
-          read -k 1 '?Press any key to close this window.'
-          print
-          exit "$review_status"
-        fi
-        if (( review_status != 0 )); then
-          print -u2 -- '\\nGitHub Copilot reported a failure after saving the draft. Nothing was submitted; review the draft below.'
-        fi
-
-        if [[ ! -s "$review_payload" ]]; then
-          print -u2 -- '\\nGitHub Copilot finished without saving the required review draft.'
-          print -u2 -- 'Nothing was submitted. Launch the review again.'
-          read -k 1 '?Press any key to close this window.'
-          print
-          exit 1
-        fi
 
         validate_review_payload() {
           python3 - "$review_payload" "$approval_celebration" <<'PY'
@@ -635,13 +620,89 @@ public struct PullRequestAgentReviewLauncher: Sendable {
             print -r -- "  $approval_celebration"
           fi
           print -- '  [e] Edit the draft with Copilot'
+          if (( review_location_failure )); then
+            print -- '  [b] Preserve inline findings in the review body'
+          fi
           print -- '  [s] Submit the draft as shown'
           print -- '  [c] Cancel without submitting'
           print -- '============================================================'
         }
 
+        preserve_inline_findings_in_body() {
+          python3 - "$review_payload" <<'PY'
+        import json
+        import os
+        import sys
+
+        payload_path = sys.argv[1]
+        with open(payload_path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+
+        comments = payload.get("comments", [])
+        if not comments:
+            raise SystemExit("the draft has no inline comments to preserve")
+
+        sections = [
+            "### Findings",
+            "GitHub could not attach these comments to the diff, so GHMenuBar preserved them in the review body.",
+        ]
+        for index, comment in enumerate(comments, start=1):
+            path = comment["path"]
+            if "line" in comment:
+                start_line = comment.get("start_line")
+                line = comment["line"]
+                line_label = f"{start_line}-{line}" if start_line is not None else str(line)
+                side_label = f" ({comment['side']})"
+            else:
+                line_label = f"diff position {comment['position']}"
+                side_label = ""
+            sections.extend([
+                f"#### {index}. `{path}:{line_label}`{side_label}",
+                comment["body"],
+            ])
+
+        original_body = payload.get("body", "").rstrip()
+        preserved_findings = "\\n\\n".join(sections)
+        payload["body"] = (
+            original_body + "\\n\\n" + preserved_findings
+            if original_body
+            else preserved_findings
+        )
+        payload["comments"] = []
+
+        temporary_path = f"{payload_path}.tmp.{os.getpid()}"
+        try:
+            with open(temporary_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+                handle.write("\\n")
+            os.replace(temporary_path, payload_path)
+        finally:
+            try:
+                os.remove(temporary_path)
+            except FileNotFoundError:
+                pass
+
+        PY
+        }
+
+        show_updated_review_draft() {
+          python3 - "$review_payload" <<'PY'
+        import json
+        import sys
+
+        with open(sys.argv[1], encoding="utf-8") as handle:
+            payload = json.load(handle)
+
+        print("\\nUPDATED REVIEW DRAFT — NOTHING SUBMITTED")
+        print(f"Event: {payload['event']}")
+        print("Body:")
+        print(payload["body"])
+        print("\\nInline comments: 0 (preserved in the body above)")
+        PY
+        }
+
         submit_review_payload() {
-          local reviewed_head current_head submission_output submission_status
+          local reviewed_head current_head submission_output submission_output_lower submission_status
           validate_review_payload || return $?
           reviewed_head=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["commit_id"])' "$review_payload") || return $?
 
@@ -651,10 +712,9 @@ public struct PullRequestAgentReviewLauncher: Sendable {
           current_head=${current_head:l}
           if [[ "$current_head" != "$reviewed_head" ]]; then
             print -u2 -- "\\nPR head changed from $reviewed_head to $current_head. Nothing was submitted."
-            print -u2 -- 'This draft is stale and cannot be updated safely. Start a new review from the current PR head.'
-            # Keep this distinct from an ordinary gh/API failure. The caller
-            # must leave the draft gate instead of offering the stale draft
-            # again indefinitely.
+            print -u2 -- 'The stale draft will be replaced by an automatic review of the latest head.'
+            # Keep this distinct from an ordinary gh/API failure so the caller
+            # can replace the stale draft without ever posting it.
             return 75
           fi
 
@@ -665,16 +725,72 @@ public struct PullRequestAgentReviewLauncher: Sendable {
           submission_status=$?
           if (( submission_status != 0 )); then
             print -r -u2 -- "$submission_output"
+            submission_output_lower=${submission_output:l}
+            if [[ "$submission_output_lower" == *'line could not be resolved'* ||
+                  "$submission_output_lower" == *'line is not part of the diff'* ]]; then
+              review_location_failure=1
+            fi
           fi
           return "$submission_status"
         }
 
+        prepare_review_draft() {
+          \(draftCommand)
+          review_status=$?
+          if (( review_status != 0 )) && [[ ! -s "$review_payload" ]]; then
+            print -u2 -- '\\nGitHub Copilot could not prepare the review draft (status '"$review_status"').'
+            print -u2 -- 'The output above contains the original failure. Nothing was submitted.'
+            return "$review_status"
+          fi
+          if (( review_status != 0 )); then
+            print -u2 -- '\\nGitHub Copilot reported a failure after saving the draft. Nothing was submitted; review the draft below.'
+          fi
+          if [[ ! -s "$review_payload" ]]; then
+            print -u2 -- '\\nGitHub Copilot finished without saving the required review draft.'
+            print -u2 -- 'Nothing was submitted.'
+            return 1
+          fi
+          return 0
+        }
+
+        review_generation=0
+        while true; do
+          if (( review_generation > 0 )); then
+            rm -f -- "$review_payload"
+            print -- '\\nRe-running GitHub Copilot against the latest PR head...'
+          fi
+          prepare_review_draft
+          review_prepare_status=$?
+          if (( review_prepare_status != 0 )); then
+            while true; do
+              read -r "review_retry_action?Choose r to retry draft generation or c to cancel: "
+              case "$review_retry_action" in
+                r|R|retry|Retry|RETRY)
+                  break
+                  ;;
+                c|C|cancel|Cancel|CANCEL|"")
+                  print -- '\\nReview cancelled. Nothing was submitted.'
+                  exit 0
+                  ;;
+                *)
+                  print -u2 -- 'Choose Retry or Cancel.'
+                  ;;
+              esac
+            done
+            continue
+          fi
+
+        review_location_failure=0
         if ! validate_review_payload; then
           print -u2 -- '\\nThe internal draft is not valid for GitHub submission. Choose Edit to correct it or Cancel.'
         fi
         while true; do
           show_review_actions
-          read -r "review_action?Choose e, s, or c: "
+          if (( review_location_failure )); then
+            read -r "review_action?Choose e, b, s, or c: "
+          else
+            read -r "review_action?Choose e, s, or c: "
+          fi
           case "$review_action" in
             e|E|edit|Edit|EDIT)
               print -- '\\nOpening the draft session for editing. Posting remains blocked.'
@@ -688,6 +804,23 @@ public struct PullRequestAgentReviewLauncher: Sendable {
                 print -u2 -- '\\nThe edited draft is not valid for GitHub submission. Edit it again or Cancel.'
               fi
               ;;
+            b|B|body|Body|BODY)
+              if (( ! review_location_failure )); then
+                print -u2 -- '\\nThe body fallback is available only after GitHub rejects an inline comment location.'
+                continue
+              fi
+              print -- '\\nPreserving the inline findings in the review body. Posting remains blocked.'
+              if ! preserve_inline_findings_in_body; then
+                print -u2 -- '\\nCould not update the draft. Nothing was submitted; choose Edit or Cancel.'
+                continue
+              fi
+              if ! validate_review_payload; then
+                print -u2 -- '\\nThe updated draft is not valid for GitHub submission. Choose Edit or Cancel.'
+                continue
+              fi
+              show_updated_review_draft
+              review_location_failure=0
+              ;;
             s|S|submit|Submit|SUBMIT)
               print -- '\\nRechecking the PR head before submission...'
               submit_review_payload
@@ -697,19 +830,45 @@ public struct PullRequestAgentReviewLauncher: Sendable {
                 exit 0
               fi
               if (( review_submit_status == 75 )); then
-                exit 75
+                while ! refresh_review_context; do
+                  print -u2 -- '\\nAutomatic refresh failed. The terminal will stay open.'
+                  read -r "review_refresh_action?Choose r to retry the refresh or c to cancel: "
+                  case "$review_refresh_action" in
+                    r|R|retry|Retry|RETRY)
+                      ;;
+                    c|C|cancel|Cancel|CANCEL|"")
+                      print -- '\\nReview cancelled. Nothing was submitted.'
+                      exit 0
+                      ;;
+                    *)
+                      print -u2 -- 'Choose Retry or Cancel.'
+                      ;;
+                  esac
+                done
+                (( review_generation += 1 ))
+                break
               fi
               print -u2 -- '\\nSubmission failed. Nothing was posted by GHMenuBar.'
-              print -u2 -- 'Choose Edit to correct the draft or Cancel. Retry Submit only after a transient GitHub error.'
+              if (( review_location_failure )); then
+                print -u2 -- 'GitHub could not attach at least one inline comment to the current diff.'
+                print -u2 -- 'Choose Edit for a precise location repair, preserve the findings in the body, or Cancel.'
+              else
+                print -u2 -- 'Choose Edit to correct the draft or Cancel. Retry Submit only after a transient GitHub error.'
+              fi
               ;;
             c|C|cancel|Cancel|CANCEL|"")
               print -- '\\nReview cancelled. Nothing was submitted.'
               exit 0
               ;;
             *)
-              print -u2 -- 'Choose Edit, Submit, or Cancel.'
+              if (( review_location_failure )); then
+                print -u2 -- 'Choose Edit, preserve in Body, Submit, or Cancel.'
+              else
+                print -u2 -- 'Choose Edit, Submit, or Cancel.'
+              fi
               ;;
           esac
+        done
         done
         """
     }
@@ -995,17 +1154,25 @@ public struct PullRequestAgentReviewLauncher: Sendable {
         review_worktree=\(Self.shellQuoted(reviewWorktree.path))
         review_worktree_created=0
 
+        remove_review_worktree() {
+          if (( review_worktree_created != 1 )); then
+            return 0
+          fi
+          git -C "$review_source_repository" worktree remove --force "$review_worktree" || return $?
+          review_worktree_created=0
+          git -C "$review_source_repository" worktree prune >/dev/null 2>&1 || true
+        }
+
         cleanup_review_worktree() {
           local review_exit_status=$?
           trap - EXIT HUP INT TERM
           if (( review_worktree_created == 1 )); then
             print -- '\nCleaning up isolated review worktree...'
-            if git -C "$review_source_repository" worktree remove --force "$review_worktree"; then
+            if remove_review_worktree; then
               print -- "Removed $review_worktree"
             else
               print -u2 -- "Could not remove $review_worktree automatically. It was left in place so you can inspect and remove it safely."
             fi
-            git -C "$review_source_repository" worktree prune >/dev/null 2>&1 || true
           fi
           exit "$review_exit_status"
         }
@@ -1025,27 +1192,58 @@ public struct PullRequestAgentReviewLauncher: Sendable {
           exit 1
         fi
 
-        print -- 'Resolving the exact pull-request head...'
-        review_head=$(\(githubCommand) pr view \(Self.shellQuoted(pullRequest.url.absoluteString)) --json headRefOid --jq '.headRefOid') || exit $?
-        if [[ ${#review_head} -ne 40 || "$review_head" == *[^0-9a-fA-F]* ]]; then
-          print -u2 -- 'GitHub returned an invalid pull-request head SHA.'
-          exit 1
-        fi
-        if ! git -C "$review_source_repository" fetch --no-tags origin \(Self.shellQuoted("pull/\(pullRequestNumber)/head")); then
-          print -u2 -- 'Could not fetch the pull-request head from the configured checkout remote named origin.'
-          exit 1
-        fi
-        review_fetched_head=$(git -C "$review_source_repository" rev-parse FETCH_HEAD) || exit $?
-        if [[ "$review_fetched_head" != "$review_head" ]]; then
-          print -u2 -- 'The pull-request head changed while the review worktree was being prepared. Launch the review again.'
-          exit 1
-        fi
-        if ! git -C "$review_source_repository" worktree add --detach "$review_worktree" "$review_head"; then
-          print -u2 -- 'Could not create the isolated review worktree.'
-          exit 1
-        fi
-        review_worktree_created=1
-        print -- "Reviewing $review_head in isolated worktree $review_worktree"
+        resolve_stable_review_head() {
+          local confirmed_head review_fetched_head
+          while true; do
+            review_head=$(\(githubCommand) pr view \(Self.shellQuoted(pullRequest.url.absoluteString)) --json headRefOid --jq '.headRefOid') || return $?
+            review_head=${review_head:l}
+            if [[ ${#review_head} -ne 40 || "$review_head" == *[^0-9a-f]* ]]; then
+              print -u2 -- 'GitHub returned an invalid pull-request head SHA.'
+              return 1
+            fi
+            if ! git -C "$review_source_repository" fetch --no-tags origin \(Self.shellQuoted("pull/\(pullRequestNumber)/head")); then
+              print -u2 -- 'Could not fetch the pull-request head from the configured checkout remote named origin.'
+              return 1
+            fi
+            review_fetched_head=$(git -C "$review_source_repository" rev-parse FETCH_HEAD) || return $?
+            review_fetched_head=${review_fetched_head:l}
+            confirmed_head=$(\(githubCommand) pr view \(Self.shellQuoted(pullRequest.url.absoluteString)) --json headRefOid --jq '.headRefOid') || return $?
+            confirmed_head=${confirmed_head:l}
+            if [[ ${#confirmed_head} -ne 40 || "$confirmed_head" == *[^0-9a-f]* ]]; then
+              print -u2 -- 'GitHub returned an invalid pull-request head SHA.'
+              return 1
+            fi
+            if [[ "$review_head" == "$review_fetched_head" && "$review_fetched_head" == "$confirmed_head" ]]; then
+              return 0
+            fi
+            print -- 'The PR head changed while the review workspace was being prepared. Updating to the latest head...'
+            sleep 1
+          done
+        }
+
+        create_review_worktree() {
+          print -- 'Resolving the exact pull-request head...'
+          resolve_stable_review_head || return $?
+          if ! git -C "$review_source_repository" worktree add --detach "$review_worktree" "$review_head"; then
+            print -u2 -- 'Could not create the isolated review worktree.'
+            return 1
+          fi
+          review_worktree_created=1
+          print -- "Reviewing $review_head in isolated worktree $review_worktree"
+        }
+
+        refresh_review_context() {
+          print -- '\nRefreshing the isolated review workspace to the latest PR head...'
+          cd "$review_source_repository" || return $?
+          if ! remove_review_worktree; then
+            print -u2 -- 'Could not replace the disposable review worktree.'
+            return 1
+          fi
+          create_review_worktree || return $?
+          cd "$review_worktree" || return $?
+        }
+
+        create_review_worktree || exit $?
         """
     }
 
@@ -1216,29 +1414,9 @@ public struct PullRequestAgentReviewLauncher: Sendable {
                 ]
             )
         case .appleTerminal:
-            let profileName = settings.appleTerminalProfile
-            guard !profileName.isEmpty else {
-                throw Error.terminalMisconfigured(
-                    terminal: terminal.displayName,
-                    details: "Enter a name for the temporary zsh session profile."
-                )
-            }
-
-            let terminalProfileURL: URL
-            do {
-                terminalProfileURL = try writeAppleTerminalProfile(
-                    scriptURL: scriptURL,
-                    profileName: profileName,
-                    in: scriptDirectory
-                )
-            } catch {
-                throw Error.processFailed(
-                    message: "Could not prepare the Apple Terminal zsh profile: \(error.localizedDescription)"
-                )
-            }
             invocation = (
-                "/usr/bin/open",
-                ["-a", "Terminal", terminalProfileURL.path]
+                "/usr/bin/osascript",
+                ["-l", "JavaScript", "-e", Self.appleTerminalLaunchJavaScript, scriptURL.path]
             )
         case .custom:
             invocation = try customTerminalInvocation(
@@ -1272,36 +1450,6 @@ public struct PullRequestAgentReviewLauncher: Sendable {
             terminal: AgentReviewTerminal.automatic.displayName,
             details: "Install Ghostty or cmux, or choose Apple Terminal."
         )
-    }
-
-    private func writeAppleTerminalProfile(
-        scriptURL: URL,
-        profileName: String,
-        in directory: URL
-    ) throws -> URL {
-        let profileURL = directory.appendingPathComponent(
-            "agent-review-\(UUID().uuidString).terminal"
-        )
-        let profile: [String: Any] = [
-            // The generated script is executable and has a /bin/zsh shebang. Give
-            // Terminal its path as the executable itself so no shell parses (or
-            // preserves) quoting characters around the filename.
-            "CommandString": scriptURL.path,
-            // Terminal's plist key is named from Terminal's perspective: true means
-            // this command is the tab's shell process, rather than input sent to the
-            // user's default login shell.
-            "RunCommandAsShell": true,
-            "ProfileCurrentVersion": 2.09,
-            "name": profileName,
-            "type": "Window Settings"
-        ]
-        let data = try PropertyListSerialization.data(
-            fromPropertyList: profile,
-            format: .xml,
-            options: 0
-        )
-        try data.write(to: profileURL, options: .atomic)
-        return profileURL
     }
 
     private func terminalApplicationPath(for terminal: AgentReviewTerminal) throws -> String {
@@ -1386,6 +1534,29 @@ public struct PullRequestAgentReviewLauncher: Sendable {
             }
         }
     }
+
+    private static let appleTerminalLaunchJavaScript = """
+    function run(argv) {
+        if (argv.length !== 1) {
+            throw new Error("Expected one review-script path.");
+        }
+
+        const terminal = Application("Terminal");
+        const reviewTab = terminal.doScript("");
+        const promptPattern = /(?:^|\\n)[^\\n]*[>$%#❯] ?\\s*$/u;
+        const commandToRun = "/bin/zsh '" + argv[0].replace(/'/g, "'\\\\''") + "'";
+
+        terminal.activate();
+        for (let attempt = 0; attempt < 300; attempt++) {
+            if (promptPattern.test(reviewTab.contents())) {
+                terminal.doScript(commandToRun, { in: reviewTab });
+                return;
+            }
+            delay(0.1);
+        }
+        throw new Error("Terminal did not show a shell prompt within 30 seconds.");
+    }
+    """
 
     private static func failureDetails(from result: ProcessResult) -> String {
         [result.stderr, result.stdout]
