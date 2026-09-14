@@ -35,6 +35,8 @@ struct GHMenuBarApp: App {
             ) { settings in
                 store.saveSettings(settings)
             }
+            .onAppear { store.isSettingsVisible = true }
+            .onDisappear { store.isSettingsVisible = false }
         }
         .windowResizability(.contentSize)
     }
@@ -220,6 +222,15 @@ final class PullRequestStore: ObservableObject {
     private let pullRequestCache: PullRequestCache
     private let pullRequestReadStateMemory: PullRequestReadStateMemory
     private var hasLoaded = false
+    var isMenuVisible = false
+    var isSettingsVisible = false
+    private var automaticRefreshLoopRunning = false
+    private var lastAutomaticRefresh: Date?
+    private var lastAuthenticationCheck: Date?
+    private var authenticationTask: Task<Void, Never>?
+    private var refreshOperationID: UUID?
+    private var generation = UUID()
+    private var manualRefreshTask: Task<Void, Never>?
     private var repositories: [String] = []
     private var cachedPullRequestsByRepository: [String: [PullRequest]] = [:]
     private var cachedPullRequestDatesByRepository: [String: Date] = [:]
@@ -236,11 +247,12 @@ final class PullRequestStore: ObservableObject {
         settingsStorage: GHMenuBarSettingsStorage = GHMenuBarSettingsStorage(),
         selectedRepositoryMemory: SelectedRepositoryMemory = SelectedRepositoryMemory(),
         pullRequestCache: PullRequestCache = PullRequestCache(),
-        pullRequestReadStateMemory: PullRequestReadStateMemory = PullRequestReadStateMemory()
+        pullRequestReadStateMemory: PullRequestReadStateMemory = PullRequestReadStateMemory(),
+        client: GitHubCLI? = nil
     ) {
         let settings = settingsStorage.settings
         self.settings = settings
-        self.client = GitHubCLI(settings: settings)
+        self.client = client ?? GitHubCLI(settings: settings)
         self.agentReviewLauncher = PullRequestAgentReviewLauncher(settings: settings.agentReview)
         self.settingsStorage = settingsStorage
         self.selectedRepositoryMemory = selectedRepositoryMemory
@@ -301,58 +313,90 @@ final class PullRequestStore: ObservableObject {
     }
 
     func runAutomaticRefreshLoop() async {
-        if settings.general.isAutomaticRefreshEnabled {
-            await refreshAutomatically()
-        }
-
+        guard !automaticRefreshLoopRunning else { return }
+        automaticRefreshLoopRunning = true
+        defer { automaticRefreshLoopRunning = false }
         while !Task.isCancelled {
+            let interval = GitHubRefreshPolicy.interval(
+                configured: settings.refreshIntervalSeconds,
+                isActive: isMenuVisible || isSettingsVisible
+            )
+            if settings.general.isAutomaticRefreshEnabled,
+               lastAutomaticRefresh.map({ Date().timeIntervalSince($0) >= interval }) ?? true {
+                await refreshAutomatically()
+                lastAutomaticRefresh = Date()
+            }
             do {
-                let interval = settings.general.isAutomaticRefreshEnabled ? settings.refreshIntervalSeconds : 60
-                try await Task.sleep(for: .seconds(interval))
+                // Re-evaluate visibility locally; this does not make an API call.
+                try await Task.sleep(for: .seconds(15))
             } catch {
                 return
             }
-
-            guard settings.general.isAutomaticRefreshEnabled else { continue }
-            await refreshAutomatically()
         }
     }
 
     func loadRepositories() async {
+        guard refreshOperationID == nil else { return }
+        let operationID = UUID()
+        let generation = generation
+        refreshOperationID = operationID
+        defer { if refreshOperationID == operationID { refreshOperationID = nil } }
         hasLoaded = true
         let selectedRepository = selection?.selectedRepository ?? selectedRepositoryMemory.selectedRepository
         state = .loadingRepositories
 
         do {
             await updateAuthenticationStatus()
+            guard self.generation == generation, !Task.isCancelled else { return }
+            guard currentUserLogin != nil else {
+                state = .failed(authenticationMessage)
+                return
+            }
             restoreCachedPullRequests()
-            repositories = try await fetchConfiguredRepositories()
+            let fetchedRepositories = try await fetchConfiguredRepositories()
+            guard self.generation == generation, !Task.isCancelled else { return }
+            repositories = fetchedRepositories
             let selection = makeSelection(selectedRepository: selectedRepository)
             state = .loaded(selection, isLoadingSelectedRepository: false, isBatchRefreshing: false)
             selectedRepositoryMemory.saveSelectedRepository(selection.selectedRepository)
             lastUpdated = selection.selectedRepository.flatMap { cachedPullRequestDatesByRepository[$0] }
             await loadSelectedRepository(force: false)
+            guard self.generation == generation, !Task.isCancelled else { return }
             scheduleRepositoryPrefetch(excluding: selection.selectedRepository)
         } catch {
-            state = .failed(error.localizedDescription)
-            lastUpdated = Date()
+            guard self.generation == generation, !Task.isCancelled else { return }
+            if !cachedPullRequestsByRepository.isEmpty {
+                if repositories.isEmpty { repositories = Array(cachedPullRequestsByRepository.keys).sorted() }
+                repositoryRefreshErrorMessage = error.localizedDescription
+                state = .loaded(makeSelection(selectedRepository: selectedRepository), isLoadingSelectedRepository: false, isBatchRefreshing: false)
+                lastUpdated = selectedRepository.flatMap { cachedPullRequestDatesByRepository[$0] }
+            } else {
+                state = .failed(error.localizedDescription)
+            }
         }
     }
 
     func refreshFromButton() {
-        Task {
-            switch state {
-            case .loaded(let selection, _, _):
-                if selection.hasMultipleRepositories {
-                    await batchRefresh()
-                } else {
-                    await loadSelectedRepository(force: true)
-                }
-            case .idle, .failed:
-                await loadRepositories()
-            case .loadingRepositories:
-                break
+        guard manualRefreshTask == nil else { return }
+        manualRefreshTask = Task {
+            defer { manualRefreshTask = nil }
+            await refreshManually()
+        }
+    }
+
+    func refreshManually() async {
+        guard refreshOperationID == nil else { return }
+        switch state {
+        case .loaded(let selection, _, _):
+            if selection.hasMultipleRepositories {
+                await batchRefresh()
+            } else {
+                await loadSelectedRepository(force: true)
             }
+        case .idle, .failed:
+            await loadRepositories()
+        case .loadingRepositories:
+            break
         }
     }
 
@@ -405,6 +449,8 @@ final class PullRequestStore: ObservableObject {
         agentReviewLauncher = PullRequestAgentReviewLauncher(settings: settings.agentReview)
 
         if settings.repositoryFilter != oldSettings.repositoryFilter {
+            generation = UUID()
+            refreshOperationID = nil
             selectedRepositoryLoadTask?.cancel()
             repositoryPrefetchTask?.cancel()
             repositoryFetches.values.forEach { $0.task.cancel() }
@@ -451,15 +497,21 @@ final class PullRequestStore: ObservableObject {
     }
 
     private func refreshAutomatically() async {
+        guard refreshOperationID == nil else { return }
         switch state {
         case .loaded:
-            await loadSelectedRepository(force: true)
-        case .idle, .loadingRepositories, .failed:
+            await loadSelectedRepository(force: false)
+        case .idle, .failed:
             await loadRepositories()
+        case .loadingRepositories:
+            break
         }
     }
 
     private func loadSelectedRepository(force: Bool) async {
+        let generation = generation
+        await updateAuthenticationStatus()
+        guard self.generation == generation, !Task.isCancelled, currentUserLogin != nil else { return }
         guard let selectedRepository = selection?.selectedRepository else { return }
         repositoryRefreshErrorMessage = nil
 
@@ -478,13 +530,14 @@ final class PullRequestStore: ObservableObject {
 
         do {
             _ = try await fetchAndCachePullRequests(repository: selectedRepository)
-            guard !Task.isCancelled else { return }
+            guard self.generation == generation, !Task.isCancelled else { return }
 
             guard selection?.selectedRepository == selectedRepository else { return }
 
             state = .loaded(makeSelection(selectedRepository: selectedRepository), isLoadingSelectedRepository: false, isBatchRefreshing: isBatchRefreshing)
             lastUpdated = cachedPullRequestDatesByRepository[selectedRepository]
         } catch {
+            guard self.generation == generation, !Task.isCancelled else { return }
             guard selection?.selectedRepository == selectedRepository else { return }
 
             repositoryRefreshErrorMessage = error.localizedDescription
@@ -497,38 +550,50 @@ final class PullRequestStore: ObservableObject {
                 lastUpdated = cachedPullRequestDatesByRepository[selectedRepository]
             } else {
                 state = .failed(error.localizedDescription)
-                lastUpdated = Date()
             }
         }
     }
 
     private func batchRefresh() async {
+        guard refreshOperationID == nil else { return }
         guard case .loaded(let selection, let isLoadingSelectedRepository, _) = state else {
             await loadRepositories()
             return
         }
-
+        let operationID = UUID()
+        let generation = generation
+        let startedAt = Date()
+        refreshOperationID = operationID
+        defer { if refreshOperationID == operationID { refreshOperationID = nil } }
+        repositoryPrefetchTask?.cancel()
         state = .loaded(selection, isLoadingSelectedRepository: isLoadingSelectedRepository, isBatchRefreshing: true)
-
-        do {
-            await updateAuthenticationStatus()
-            let pullRequests = try await fetchConfiguredOpenPullRequests()
-            cachedPullRequestsByRepository = Dictionary(grouping: pullRequests, by: \.repository)
-            let fetchedAt = Date()
-            cachedPullRequestDatesByRepository = Dictionary(
-                uniqueKeysWithValues: cachedPullRequestsByRepository.keys.map { ($0, fetchedAt) }
-            )
-            persistCachedPullRequests()
-
-            let selectedRepository = selection.selectedRepository
-            state = .loaded(makeSelection(selectedRepository: selectedRepository), isLoadingSelectedRepository: false, isBatchRefreshing: false)
-            lastUpdated = Date()
-            await loadSelectedRepository(force: false)
-            scheduleRepositoryPrefetch(excluding: selectedRepository)
-        } catch {
-            state = .failed(error.localizedDescription)
-            lastUpdated = Date()
+        repositoryRefreshErrorMessage = nil
+        await updateAuthenticationStatus()
+        guard self.generation == generation, !Task.isCancelled else { return }
+        // Query the selected repository first, then the exact watched set. Keep
+        // complete cache entries until each replacement has successfully arrived.
+        let targets = [selection.selectedRepository].compactMap { $0 }
+            + repositories.filter { $0 != selection.selectedRepository }
+        if currentUserLogin != nil {
+            for repository in targets {
+                guard self.generation == generation, !Task.isCancelled else { return }
+                // A prefetch already in flight may have finished while the
+                // selected repository refreshed. Do not immediately repeat it.
+                if hasCompleteCache(for: repository),
+                   let fetchedAt = cachedPullRequestDatesByRepository[repository], fetchedAt >= startedAt { continue }
+                do {
+                    _ = try await fetchAndCachePullRequests(repository: repository)
+                } catch {
+                    guard self.generation == generation, !Task.isCancelled else { return }
+                    repositoryRefreshErrorMessage = error.localizedDescription
+                    if case GitHubCLIError.rateLimited = error { break }
+                }
+            }
         }
+        guard self.generation == generation, !Task.isCancelled else { return }
+        let selectedRepository = self.selection?.selectedRepository ?? selection.selectedRepository
+        state = .loaded(makeSelection(selectedRepository: selectedRepository), isLoadingSelectedRepository: false, isBatchRefreshing: false)
+        lastUpdated = selectedRepository.flatMap { cachedPullRequestDatesByRepository[$0] }
     }
 
     private func makeSelection(selectedRepository: String?) -> PullRequestRepositorySelection {
@@ -563,39 +628,84 @@ final class PullRequestStore: ObservableObject {
         return settings.repositoryFilter.filteredRepositories(repositories)
     }
 
-    private func fetchConfiguredOpenPullRequests() async throws -> [PullRequest] {
-        let organizations = settings.repositoryFilter.organizations
-        let pullRequests: [PullRequest]
-
-        if organizations.isEmpty {
-            pullRequests = try await client.fetchOpenPullRequests()
-        } else {
-            var scopedPullRequests: [PullRequest] = []
-            for organization in organizations {
-                scopedPullRequests.append(contentsOf: try await client.fetchOpenPullRequests(owner: organization))
-            }
-            pullRequests = scopedPullRequests
+    private func updateAuthenticationStatus() async {
+        if let authenticationTask {
+            await authenticationTask.value
+            return
         }
-
-        return pullRequests.filter { settings.repositoryFilter.allows(repository: $0.repository) }
+        let task = Task { await checkAuthentication() }
+        authenticationTask = task
+        await task.value
+        authenticationTask = nil
     }
 
-    private func updateAuthenticationStatus() async {
-        let previousLogin = currentUserLogin
-        authenticationStatus = await client.authenticationStatus()
-
-        if case .authenticated(let login) = authenticationStatus {
-            currentUserLogin = login
-        } else {
-            currentUserLogin = nil
+    private var authenticationMessage: String {
+        switch authenticationStatus {
+        case .unauthenticated(let message), .unavailable(let message): return message
+        default: return "GitHub account could not be verified."
         }
+    }
 
+    private func checkAuthentication() async {
+        let generation = generation
+        let configuredLogin = await client.configuredLogin()
+        guard self.generation == generation, !Task.isCancelled else { return }
+        let previousLogin = currentUserLogin
+        if let configuredLogin, configuredLogin.caseInsensitiveCompare(currentUserLogin ?? "") != .orderedSame {
+            currentUserLogin = nil
+            lastAuthenticationCheck = nil
+            authenticationStatus = .unknown
+            clearAccountData()
+            if pullRequestCache.savedLogin?.caseInsensitiveCompare(configuredLogin) == .orderedSame {
+                currentUserLogin = configuredLogin
+                restoreCachedPullRequests()
+            }
+            updateDisplayedCache()
+        }
+        if let lastAuthenticationCheck, Date().timeIntervalSince(lastAuthenticationCheck) < 3_600,
+           currentUserLogin != nil, case .authenticated = authenticationStatus {
+            return
+        }
+        let result = await client.authenticationStatus()
+        guard self.generation == generation, !Task.isCancelled else { return }
+        authenticationStatus = result
+        switch result {
+        case .authenticated(let login):
+            if let currentUserLogin, currentUserLogin.caseInsensitiveCompare(login) != .orderedSame {
+                clearAccountData()
+            }
+            currentUserLogin = login
+            lastAuthenticationCheck = Date()
+        case .unauthenticated:
+            currentUserLogin = nil
+            lastAuthenticationCheck = nil
+            clearAccountData()
+        case .unknown, .unavailable:
+            // A rate limit or network failure says nothing about credentials.
+            // Keep the last known account and its cache if the local account agrees.
+            break
+        }
         if previousLogin?.caseInsensitiveCompare(currentUserLogin ?? "") != .orderedSame {
-            cachedPullRequestsByRepository = [:]
-            cachedPullRequestDatesByRepository = [:]
             pullRequestReadState = currentUserLogin.map {
                 pullRequestReadStateMemory.state(for: $0)
             } ?? PullRequestReadState()
+            updateDisplayedCache()
+        }
+    }
+
+    private func clearAccountData() {
+        cachedPullRequestsByRepository = [:]
+        cachedPullRequestDatesByRepository = [:]
+        repositoryFetches.values.forEach { $0.task.cancel() }
+        repositoryFetches = [:]
+        pullRequestReadState = PullRequestReadState()
+    }
+
+    private func updateDisplayedCache() {
+        if case .loaded(let selection, let loading, let batch) = state {
+            state = .loaded(makeSelection(selectedRepository: selection.selectedRepository),
+                            isLoadingSelectedRepository: loading, isBatchRefreshing: batch)
+            lastUpdated = selection.selectedRepository.flatMap { cachedPullRequestDatesByRepository[$0] }
         }
     }
 
@@ -617,7 +727,9 @@ final class PullRequestStore: ObservableObject {
 
     private func isCacheFresh(for repository: String, now: Date = Date()) -> Bool {
         guard let fetchedAt = cachedPullRequestDatesByRepository[repository] else { return false }
-        return now.timeIntervalSince(fetchedAt) < TimeInterval(settings.refreshIntervalSeconds)
+        let interval = GitHubRefreshPolicy.interval(configured: settings.refreshIntervalSeconds,
+                                                   isActive: isMenuVisible || isSettingsVisible)
+        return now.timeIntervalSince(fetchedAt) < interval
     }
 
     private func hasCompleteCache(for repository: String) -> Bool {
@@ -626,6 +738,8 @@ final class PullRequestStore: ObservableObject {
     }
 
     private func fetchAndCachePullRequests(repository: String) async throws -> [PullRequest] {
+        let generation = generation
+        let account = currentUserLogin
         let fetch: RepositoryFetch
         if let existingFetch = repositoryFetches[repository] {
             fetch = existingFetch
@@ -641,6 +755,7 @@ final class PullRequestStore: ObservableObject {
 
         do {
             let pullRequests = try await fetch.task.value
+            guard self.generation == generation, currentUserLogin == account else { throw CancellationError() }
             if repositoryFetches[repository]?.id == fetch.id {
                 repositoryFetches[repository] = nil
                 cachedPullRequestsByRepository[repository] = pullRequests
@@ -667,7 +782,15 @@ final class PullRequestStore: ObservableObject {
             guard let self else { return }
             for repository in repositoriesToPrefetch {
                 guard !Task.isCancelled else { return }
-                _ = try? await fetchAndCachePullRequests(repository: repository)
+                guard !hasCompleteCache(for: repository) || !isCacheFresh(for: repository) else { continue }
+                do {
+                    _ = try await fetchAndCachePullRequests(repository: repository)
+                } catch {
+                    if case GitHubCLIError.rateLimited = error {
+                        repositoryRefreshErrorMessage = error.localizedDescription
+                        break
+                    }
+                }
             }
         }
     }
@@ -716,6 +839,11 @@ struct PullRequestMenuView: View {
         } message: {
             Text(store.agentReviewLaunchErrorMessage ?? "The review agent could not be launched.")
         }
+        .onAppear {
+            store.isMenuVisible = true
+            Task { await store.refreshIfNeeded() }
+        }
+        .onDisappear { store.isMenuVisible = false }
     }
 
     private var header: some View {
@@ -1056,6 +1184,7 @@ struct PullRequestSettingsView: View {
     @State private var isLoadingAccounts = false
     @State private var isLoadingRepositories = false
     @State private var repositoryLoadMessage: String?
+    @State private var apiUsage: GitHubAPIUsage?
     private let settingsClient = GitHubCLI()
 
     init(
@@ -1122,6 +1251,12 @@ struct PullRequestSettingsView: View {
             settingsFooter
         }
         .frame(width: 820, height: 720)
+        .task {
+            while !Task.isCancelled {
+                apiUsage = await settingsClient.apiUsage()
+                do { try await Task.sleep(for: .seconds(10)) } catch { return }
+            }
+        }
     }
 
     private var settingsHeader: some View {
@@ -1202,7 +1337,7 @@ struct PullRequestSettingsView: View {
                         systemImage: "timer",
                         iconColor: GeneralSettingsPalette.sync,
                         title: "Refresh interval",
-                        detail: "Minimum is 60 seconds."
+                        detail: "Used while the menu or settings are open. Idle refreshes run at least 15 minutes apart. Minimum is 60 seconds."
                     ) {
                         HStack(spacing: 8) {
                             TextField("Refresh interval", value: $draft.refreshIntervalSeconds, formatter: Self.integerFormatter)
@@ -1263,6 +1398,16 @@ struct PullRequestSettingsView: View {
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
+                    }
+                    GeneralSettingRow(
+                        systemImage: "chart.bar",
+                        iconColor: GeneralSettingsPalette.github,
+                        title: "App requests · last hour",
+                        detail: "Counts include retries and pagination. Account quotas are shared with your other tools."
+                    ) {
+                        Text(apiUsage?.summary ?? "No requests observed")
+                            .font(.caption.monospacedDigit())
+                            .help(apiUsage?.detail ?? "Usage is collected locally as this app makes requests.")
                     }
                 }
 
@@ -1351,7 +1496,7 @@ struct PullRequestSettingsView: View {
             return "GitHub CLI status has not been checked yet."
         case .authenticated:
             return "Using the local GitHub CLI session."
-        case .unauthenticated(let message):
+        case .unauthenticated(let message), .unavailable(let message):
             return message
         }
     }
@@ -1394,7 +1539,7 @@ struct PullRequestSettingsView: View {
         defer { isLoadingAccounts = false }
 
         do {
-            let accounts = try await settingsClient.fetchAccounts()
+            let accounts = try await settingsClient.fetchAccounts(knownLogin: currentUserLogin)
             availableAccounts = accounts
 
             if draft.organizations.isEmpty, let viewerAccount = accounts.first {
@@ -1407,6 +1552,7 @@ struct PullRequestSettingsView: View {
 
     @MainActor
     private func loadRepositoriesForSelectedAccounts() async {
+        guard !isLoadingRepositories else { return }
         let selectedAccounts = draft.organizations
         guard !selectedAccounts.isEmpty else {
             draft.includedRepositories = []
@@ -1421,7 +1567,12 @@ struct PullRequestSettingsView: View {
 
         isLoadingRepositories = true
         repositoryLoadMessage = nil
-        defer { isLoadingRepositories = false }
+        defer {
+            isLoadingRepositories = false
+            if selectedAccounts != draft.organizations {
+                Task { await loadRepositoriesForSelectedAccounts() }
+            }
+        }
 
         do {
             for account in accountsToLoad {
@@ -3375,6 +3526,8 @@ struct AuthenticationStatusBadge: View {
             return "checkmark.circle.fill"
         case .unauthenticated:
             return "xmark.circle.fill"
+        case .unavailable:
+            return "exclamationmark.clock.fill"
         }
     }
 
@@ -3386,6 +3539,8 @@ struct AuthenticationStatusBadge: View {
             return .green
         case .unauthenticated:
             return .red
+        case .unavailable:
+            return .orange
         }
     }
 
@@ -3397,6 +3552,8 @@ struct AuthenticationStatusBadge: View {
             return "gh authenticated as \(login)"
         case .unauthenticated(let message):
             return "gh not authenticated: \(message)"
+        case .unavailable(let message):
+            return message
         }
     }
 }

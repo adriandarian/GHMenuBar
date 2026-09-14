@@ -4,11 +4,13 @@ public struct ProcessResult: Equatable, Sendable {
     public let stdout: String
     public let stderr: String
     public let exitCode: Int32
+    public let httpObservations: [GitHubHTTPObservation]
 
-    public init(stdout: String, stderr: String, exitCode: Int32) {
+    public init(stdout: String, stderr: String, exitCode: Int32, httpObservations: [GitHubHTTPObservation] = []) {
         self.stdout = stdout
         self.stderr = stderr
         self.exitCode = exitCode
+        self.httpObservations = httpObservations
     }
 }
 
@@ -20,9 +22,13 @@ public enum GitHubCLIError: Error, LocalizedError, Equatable {
     case commandFailed(message: String, exitCode: Int32)
     case invalidJSON(message: String)
     case processFailed(message: String)
+    case rateLimited(resource: String, retryAt: Date)
 
     public var errorDescription: String? {
         switch self {
+        case .rateLimited(let resource, let retryAt):
+            let name = resource == "graphql" ? "GraphQL" : resource == "core" ? "REST" : "API"
+            return "GitHub \(name) requests paused until \(retryAt.formatted(date: .omitted, time: .shortened)) to protect your account’s rate limit. Cached pull requests remain available."
         case .commandFailed(let message, _),
              .invalidJSON(let message),
              .processFailed(let message):
@@ -35,6 +41,7 @@ public enum GitHubAuthenticationStatus: Equatable, Sendable {
     case unknown
     case authenticated(login: String)
     case unauthenticated(message: String)
+    case unavailable(message: String)
 }
 
 public struct GitHubCLI: Sendable {
@@ -61,20 +68,24 @@ public struct GitHubCLI: Sendable {
 
     private let owner: String
     private let runner: ProcessRunning
+    private let coordinator: GitHubRequestCoordinator
 
     public init(
         owner: String = GHMenuBarSettings.default.githubOwner,
-        runner: ProcessRunning = DefaultProcessRunner()
+        runner: ProcessRunning = GitHubProcessRunner(),
+        coordinator: GitHubRequestCoordinator = .shared
     ) {
         self.owner = owner.trimmingCharacters(in: .whitespacesAndNewlines)
         self.runner = runner
+        self.coordinator = coordinator
     }
 
     public init(
         settings: GHMenuBarSettings,
-        runner: ProcessRunning = DefaultProcessRunner()
+        runner: ProcessRunning = GitHubProcessRunner(),
+        coordinator: GitHubRequestCoordinator = .shared
     ) {
-        self.init(owner: GHMenuBarSettings.default.githubOwner, runner: runner)
+        self.init(owner: GHMenuBarSettings.default.githubOwner, runner: runner, coordinator: coordinator)
     }
 
     public static func openPullRequestsCommand(limit: Int) -> [String] {
@@ -131,7 +142,19 @@ public struct GitHubCLI: Sendable {
     }
 
     public static func viewerLoginCommand() -> [String] {
-        ["api", "user", "--jq", ".login"]
+        ["api", "graphql", "-f", "query=query { viewer { login } rateLimit { cost remaining resetAt } }", "--jq", ".data.viewer.login"]
+    }
+
+    /// Reading the active local account does not use an API request. An injected
+    /// environment token takes precedence, so its identity must be verified online.
+    public func configuredLogin() async -> String? {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["GH_TOKEN"] == nil, environment["GITHUB_TOKEN"] == nil else { return nil }
+        guard let result = try? await runner.run(executable: "gh", arguments: ["config", "get", "user", "--host", "github.com"]),
+              result.exitCode == 0 else { return nil }
+        let login = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !login.isEmpty { await coordinator.useAccount(login) }
+        return login.isEmpty ? nil : login
     }
 
     public static func organizationListCommand() -> [String] {
@@ -195,8 +218,9 @@ public struct GitHubCLI: Sendable {
         return Self.lines(from: result.stdout)
     }
 
-    public func fetchAccounts() async throws -> [String] {
-        let viewerLogin = try await fetchViewerLogin()
+    public func fetchAccounts(knownLogin: String? = nil) async throws -> [String] {
+        let viewerLogin: String
+        if let knownLogin { viewerLogin = knownLogin } else { viewerLogin = try await fetchViewerLogin() }
         let organizations = try await fetchOrganizations()
         return Self.uniquePreservingOrder([viewerLogin] + organizations)
     }
@@ -211,28 +235,36 @@ public struct GitHubCLI: Sendable {
             return .authenticated(login: login)
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            return .unauthenticated(message: message)
+            let lower = message.lowercased()
+            if lower.contains("credentials were rejected") || lower.contains("bad credentials")
+                || lower.contains("gh auth login required") || lower.contains("not logged into")
+                || lower.contains("to get started with github cli") {
+                return .unauthenticated(message: message)
+            }
+            return .unavailable(message: message)
+        }
+    }
+
+    public func apiUsage() async -> GitHubAPIUsage { await coordinator.usage() }
+
+    private func runAttempt(arguments: [String]) async throws -> ProcessResult {
+        do {
+            return try await coordinator.run(arguments: arguments, runner: runner)
+        } catch let error as GitHubCLIError {
+            throw error
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw GitHubCLIError.processFailed(message: error.localizedDescription)
         }
     }
 
     private func runGitHubCommand(arguments: [String]) async throws -> ProcessResult {
-        var result: ProcessResult
-        do {
-            result = try await runner.run(
-                executable: "gh",
-                arguments: arguments
-            )
-        } catch {
-            throw GitHubCLIError.processFailed(message: error.localizedDescription)
-        }
+        var result = try await runAttempt(arguments: arguments)
 
         for delay in Self.transientRetryDelays where Self.isTransientFailure(result) {
             try await Task.sleep(for: delay)
-            do {
-                result = try await runner.run(executable: "gh", arguments: arguments)
-            } catch {
-                throw GitHubCLIError.processFailed(message: error.localizedDescription)
-            }
+            result = try await runAttempt(arguments: arguments)
         }
 
         // gh can report API/network failures on stderr while still exiting 0.
@@ -254,15 +286,7 @@ public struct GitHubCLI: Sendable {
                     arguments: ["config", "clear-cache"]
                 )
 
-                let retryResult: ProcessResult
-                do {
-                    retryResult = try await runner.run(
-                        executable: "gh",
-                        arguments: arguments
-                    )
-                } catch {
-                    throw GitHubCLIError.processFailed(message: error.localizedDescription)
-                }
+                let retryResult = try await runAttempt(arguments: arguments)
 
                 guard retryResult.exitCode == 0 else {
                     let message = Self.commandFailureMessage(for: retryResult)
@@ -311,9 +335,10 @@ public struct GitHubCLI: Sendable {
             .joined(separator: "\n")
             .lowercased()
 
-        return output.contains("502")
-            || output.contains("503")
-            || output.contains("504")
+        guard !GitHubRequestCoordinator.isRateLimitFailure(result) else { return false }
+        return output.contains("http 502") || output.contains("502 bad gateway")
+            || output.contains("http 503") || output.contains("503 service unavailable")
+            || output.contains("http 504") || output.contains("504 gateway timeout")
             || output.contains("gateway timeout")
             || output.contains("timed out")
             || output.contains("timeout")
@@ -357,7 +382,10 @@ struct GitHubRepositoryDTO: Decodable {
 }
 
 public struct DefaultProcessRunner: ProcessRunning {
-    public init() {}
+    private let environmentOverrides: [String: String]
+    public init(environmentOverrides: [String: String] = [:]) {
+        self.environmentOverrides = environmentOverrides
+    }
 
     static func searchPath(existingPath: String?) -> String {
         let existingComponents = (existingPath ?? "")
@@ -405,6 +433,7 @@ public struct DefaultProcessRunner: ProcessRunning {
             let stdout = Pipe()
             let stderr = Pipe()
             var environment = ProcessInfo.processInfo.environment
+            environment.merge(environmentOverrides) { _, newValue in newValue }
             let searchPath = Self.searchPath(existingPath: environment["PATH"])
             let executablePath = Self.executablePath(executable: executable, searchPath: searchPath)
 

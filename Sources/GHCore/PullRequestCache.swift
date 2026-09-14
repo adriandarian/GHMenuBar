@@ -29,6 +29,12 @@ public struct PullRequestCache {
         self.key = key
     }
 
+    public var savedLogin: String? {
+        guard let data = defaults.data(forKey: key),
+              let snapshot = try? JSONDecoder().decode(Snapshot.self, from: data) else { return nil }
+        return snapshot.login
+    }
+
     public func entries(for login: String) -> [String: PullRequestCacheEntry] {
         guard let data = defaults.data(forKey: key),
               let snapshot = try? JSONDecoder().decode(Snapshot.self, from: data),

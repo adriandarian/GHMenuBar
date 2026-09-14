@@ -21,6 +21,10 @@ let package = Package(
         .testTarget(
             name: "GHCoreTests",
             dependencies: ["GHCore"]
+        ),
+        .testTarget(
+            name: "GHMenuBarTests",
+            dependencies: ["GHMenuBar", "GHCore"]
         )
     ]
 )
