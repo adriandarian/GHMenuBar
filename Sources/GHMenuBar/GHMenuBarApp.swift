@@ -213,6 +213,7 @@ final class PullRequestStore: ObservableObject {
     @Published var selectedSettingsTab: PullRequestSettingsTab = .general
     @Published private(set) var agentReviewLaunchErrorMessage: String?
     @Published private(set) var repositoryRefreshErrorMessage: String?
+    @Published private(set) var repositoryRefreshErrorRepository: String?
     @Published private(set) var pullRequestReadState = PullRequestReadState()
 
     private var client: GitHubCLI
@@ -513,7 +514,7 @@ final class PullRequestStore: ObservableObject {
         await updateAuthenticationStatus()
         guard self.generation == generation, !Task.isCancelled, currentUserLogin != nil else { return }
         guard let selectedRepository = selection?.selectedRepository else { return }
-        repositoryRefreshErrorMessage = nil
+        clearRepositoryRefreshError()
 
         if !force,
            hasCompleteCache(for: selectedRepository),
@@ -540,7 +541,7 @@ final class PullRequestStore: ObservableObject {
             guard self.generation == generation, !Task.isCancelled else { return }
             guard selection?.selectedRepository == selectedRepository else { return }
 
-            repositoryRefreshErrorMessage = error.localizedDescription
+            setRepositoryRefreshError(error, repository: selectedRepository)
             if cachedPullRequestsByRepository[selectedRepository] != nil {
                 state = .loaded(
                     makeSelection(selectedRepository: selectedRepository),
@@ -567,7 +568,7 @@ final class PullRequestStore: ObservableObject {
         defer { if refreshOperationID == operationID { refreshOperationID = nil } }
         repositoryPrefetchTask?.cancel()
         state = .loaded(selection, isLoadingSelectedRepository: isLoadingSelectedRepository, isBatchRefreshing: true)
-        repositoryRefreshErrorMessage = nil
+        clearRepositoryRefreshError()
         await updateAuthenticationStatus()
         guard self.generation == generation, !Task.isCancelled else { return }
         // Query the selected repository first, then the exact watched set. Keep
@@ -585,7 +586,7 @@ final class PullRequestStore: ObservableObject {
                     _ = try await fetchAndCachePullRequests(repository: repository)
                 } catch {
                     guard self.generation == generation, !Task.isCancelled else { return }
-                    repositoryRefreshErrorMessage = error.localizedDescription
+                    setRepositoryRefreshError(error, repository: repository)
                     if case GitHubCLIError.rateLimited = error { break }
                 }
             }
@@ -709,6 +710,16 @@ final class PullRequestStore: ObservableObject {
         }
     }
 
+    private func clearRepositoryRefreshError() {
+        repositoryRefreshErrorMessage = nil
+        repositoryRefreshErrorRepository = nil
+    }
+
+    private func setRepositoryRefreshError(_ error: Error, repository: String? = nil) {
+        repositoryRefreshErrorMessage = error.localizedDescription
+        repositoryRefreshErrorRepository = repository
+    }
+
     private func restoreCachedPullRequests() {
         guard let currentUserLogin else { return }
         let entries = pullRequestCache.entries(for: currentUserLogin)
@@ -787,7 +798,7 @@ final class PullRequestStore: ObservableObject {
                     _ = try await fetchAndCachePullRequests(repository: repository)
                 } catch {
                     if case GitHubCLIError.rateLimited = error {
-                        repositoryRefreshErrorMessage = error.localizedDescription
+                        setRepositoryRefreshError(error, repository: repository)
                         break
                     }
                 }
@@ -858,6 +869,7 @@ struct PullRequestMenuView: View {
                     Text(statusText)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .help(store.repositoryRefreshErrorMessage ?? statusText)
                 }
 
                 Spacer()
@@ -1146,6 +1158,11 @@ struct PullRequestMenuView: View {
         }
 
         if store.repositoryRefreshErrorMessage != nil {
+            if let repository = store.repositoryRefreshErrorRepository?
+                .split(separator: "/")
+                .last {
+                return "Refresh failed for \(repository) — showing cached data"
+            }
             return "Refresh failed — showing cached data"
         }
 

@@ -18,6 +18,7 @@ final class PullRequestStoreRefreshTests: XCTestCase {
         XCTAssertTrue(after.allSatisfy(\.hasReviewMetadata))
         XCTAssertEqual(fixture.store.currentUserLogin, "dariana")
         XCTAssertNotNil(fixture.store.repositoryRefreshErrorMessage)
+        XCTAssertEqual(fixture.store.repositoryRefreshErrorRepository, "acme/beta")
         let commands = await fixture.runner.commands
         XCTAssertFalse(commands.contains { $0.first == "search" || $0.first == "repo" })
         XCTAssertEqual(commands.filter { $0 == GitHubCLI.viewerLoginCommand() }.count, 1)

@@ -49,7 +49,15 @@ public struct GitHubCLI: Sendable {
     public static let defaultOpenPullRequestLimit = 1_000
     public static let defaultRepositoryOpenPullRequestLimit = 48
     private static let badCredentialsMessage = "GitHub credentials were rejected. Run `gh auth login -h github.com` or `gh auth refresh -h github.com`."
-    private static let transientRetryDelays: [Duration] = [.milliseconds(250), .milliseconds(750)]
+    // GitHub occasionally returns a short-lived 502 for the relatively rich
+    // pull-request query. Keep retries bounded, but give the service a useful
+    // recovery window instead of surfacing a one-second outage to the user.
+    static let transientRetryDelays: [Duration] = [
+        .milliseconds(500),
+        .seconds(1),
+        .seconds(2),
+        .seconds(4)
+    ]
     private static let searchPullRequestJSONFields = "number,title,url,repository,author,updatedAt,isDraft"
     private static let repositoryPullRequestJSONFields = [
         "number",

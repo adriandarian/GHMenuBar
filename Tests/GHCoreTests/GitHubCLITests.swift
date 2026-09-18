@@ -3,6 +3,13 @@ import XCTest
 @testable import GHCore
 
 final class GitHubCLITests: XCTestCase {
+    func testTransientRetryPolicyGivesGitHubAUsefulRecoveryWindow() {
+        XCTAssertEqual(
+            GitHubCLI.transientRetryDelays,
+            [.milliseconds(500), .seconds(1), .seconds(2), .seconds(4)]
+        )
+    }
+
     func testRepositoryListCommandCanUseAuthenticatedDefaultScope() {
         XCTAssertEqual(
             GitHubCLI.repositoryListCommand(owner: "", limit: 100),
